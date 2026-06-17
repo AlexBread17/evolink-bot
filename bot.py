@@ -5,7 +5,8 @@ Flow per video:
   1. You tap the "New video" button (or send /go)
   2. Bot asks for an image     -> you send a photo
   3. Bot asks for the dialogue -> you type just the spoken line
-  4. Bot drops your line into the fixed prompt template, uploads the image,
+  4. Bot asks the quality      -> you tap 480p or 720p
+  5. Bot drops your line into the fixed prompt template, uploads the image,
      generates, and sends the video back
 
 The prompt is a fixed template (see PROMPT_TEMPLATE); only the dialogue line and
@@ -68,6 +69,7 @@ PROMPT_TEMPLATE = (
 GEN_URL = "https://api.evolink.ai/v1/videos/generations"
 TASK_URL = "https://api.evolink.ai/v1/tasks/{task_id}"
 UPLOAD_URL = "https://files-api.evolink.ai/api/v1/files/upload/stream"
+CREDITS_URL = "https://api.evolink.ai/v1/credits"
 
 # Polling
 POLL_INTERVAL = 5
@@ -77,7 +79,7 @@ POLL_TIMEOUT = 600        # 10 min
 TG_UPLOAD_LIMIT = 50 * 1024 * 1024
 
 # Conversation states
-ASK_IMAGE, ASK_DIALOGUE = range(2)
+ASK_IMAGE, ASK_DIALOGUE, ASK_QUALITY = range(3)
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO
@@ -86,6 +88,10 @@ log = logging.getLogger("evolink-bot")
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [["🎬 New video"]], resize_keyboard=True, one_time_keyboard=False
+)
+
+QUALITY_KEYBOARD = ReplyKeyboardMarkup(
+    [["480p", "720p"]], resize_keyboard=True, one_time_keyboard=True
 )
 
 
@@ -115,13 +121,13 @@ async def upload_image(session: aiohttp.ClientSession, img_bytes: bytes,
 
 
 async def submit_job(session: aiohttp.ClientSession, prompt: str,
-                     image_url: str) -> str:
+                     image_url: str, quality: str = QUALITY) -> str:
     payload = {
         "model": MODEL,
         "prompt": prompt,
         "image_urls": [image_url],
         "duration": DURATION,
-        "quality": QUALITY,
+        "quality": quality,
         "aspect_ratio": ASPECT_RATIO,
         "generate_audio": GENERATE_AUDIO,
         "content_filter": CONTENT_FILTER,
@@ -175,6 +181,19 @@ async def fetch_bytes(session: aiohttp.ClientSession, url: str):
         return data, len(data)
 
 
+async def get_credits(session: aiohttp.ClientSession):
+    """Return the account's remaining credits (float), or None if unavailable."""
+    headers = {"Authorization": f"Bearer {EVOLINK_KEY}"}
+    try:
+        async with session.get(CREDITS_URL, headers=headers) as r:
+            body = await r.json()
+            user = (body.get("data") or {}).get("user") or {}
+            val = user.get("remaining_credits")
+            return float(val) if val is not None else None
+    except Exception:  # noqa: BLE001 - never let a balance check break generation
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Conversation handlers
 # ---------------------------------------------------------------------------
@@ -183,11 +202,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "Ready. Tap “🎬 New video” (or send /go) to make one.\n"
-        f"Fixed settings: {QUALITY}, {DURATION}s, {ASPECT_RATIO}, "
+        f"Fixed: {DURATION}s, {ASPECT_RATIO}, "
         f"audio {'on' if GENERATE_AUDIO else 'off'}, "
-        f"filter {'off' if not CONTENT_FILTER else 'on'}.",
+        f"filter {'off' if not CONTENT_FILTER else 'on'}. "
+        "Quality (480p/720p) you pick each time.\n"
+        "Send /balance to check remaining credits.",
         reply_markup=MAIN_KEYBOARD,
     )
+
+
+async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not authorised(update):
+        return
+    async with aiohttp.ClientSession() as session:
+        bal = await get_credits(session)
+    if bal is None:
+        await update.message.reply_text("Couldn't fetch the balance right now.")
+    else:
+        await update.message.reply_text(f"💳 {bal:.2f} credits remaining.")
 
 
 async def go(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -231,32 +263,62 @@ async def got_dialogue(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Strip any quotes the user typed around it, since the template adds its own.
     dialogue = dialogue.strip("\u201c\u201d\"'")
-    prompt = PROMPT_TEMPLATE.format(dialogue=dialogue)
+    context.user_data["dialogue"] = dialogue
 
-    img_bytes = context.user_data.get("image_bytes")
-    if not img_bytes:
-        await update.message.reply_text("Lost the image — let's restart. Tap “🎬 New video”.")
+    await update.message.reply_text("Quality? Tap one.", reply_markup=QUALITY_KEYBOARD)
+    return ASK_QUALITY
+
+
+async def got_quality(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not authorised(update):
         return ConversationHandler.END
 
-    status_msg = await update.message.reply_text("Uploading image…")
+    quality = (update.message.text or "").strip()
+    if quality not in ("480p", "720p"):
+        await update.message.reply_text("Tap 480p or 720p.", reply_markup=QUALITY_KEYBOARD)
+        return ASK_QUALITY
+
+    dialogue = context.user_data.get("dialogue")
+    img_bytes = context.user_data.get("image_bytes")
+    if not dialogue or not img_bytes:
+        await update.message.reply_text("Lost the details — let's restart. Tap “🎬 New video”.",
+                                        reply_markup=MAIN_KEYBOARD)
+        return ConversationHandler.END
+
+    prompt = PROMPT_TEMPLATE.format(dialogue=dialogue)
+
+    status_msg = await update.message.reply_text(f"Uploading image… ({quality})")
     timeout = aiohttp.ClientTimeout(total=POLL_TIMEOUT + 120)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
+            credits_before = await get_credits(session)
             image_url = await upload_image(session, img_bytes)
             await status_msg.edit_text("Generating… 1–3 min.")
-            task_id = await submit_job(session, prompt, image_url)
+            task_id = await submit_job(session, prompt, image_url, quality)
             await status_msg.edit_text(f"Working… (task {task_id[:18]})")
             video_url = await poll_job(session, task_id)
             data, size = await fetch_bytes(session, video_url)
 
+            # Work out cost + remaining balance from real before/after figures.
+            credits_after = await get_credits(session)
+            if credits_after is not None and credits_before is not None:
+                used = max(credits_before - credits_after, 0)
+                cost_line = f"\n💳 Used {used:.2f} credits · {credits_after:.2f} left"
+            elif credits_after is not None:
+                cost_line = f"\n💳 {credits_after:.2f} credits left"
+            else:
+                cost_line = ""
+
             if data is None:
                 await status_msg.edit_text(
                     f"Video is {size/1_048_576:.1f} MB — too big for Telegram upload.\n"
-                    f"Direct link (expires in 24h, save now):\n{video_url}"
+                    f"Direct link (expires in 24h, save now):\n{video_url}{cost_line}"
                 )
             else:
                 await update.message.reply_video(
-                    video=data, caption=dialogue[:200], supports_streaming=True
+                    video=data,
+                    caption=(dialogue[:180] + cost_line),
+                    supports_streaming=True,
                 )
                 await status_msg.delete()
     except Exception as e:  # noqa: BLE001
@@ -264,6 +326,7 @@ async def got_dialogue(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(f"Failed: {e}")
     finally:
         context.user_data.pop("image_bytes", None)
+        context.user_data.pop("dialogue", None)
 
     await update.message.reply_text("Done. Tap “🎬 New video” for another.",
                                     reply_markup=MAIN_KEYBOARD)
@@ -272,6 +335,7 @@ async def got_dialogue(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("image_bytes", None)
+    context.user_data.pop("dialogue", None)
     await update.message.reply_text("Cancelled.", reply_markup=MAIN_KEYBOARD)
     return ConversationHandler.END
 
@@ -289,11 +353,13 @@ def main():
                 (filters.PHOTO | filters.Document.IMAGE) & ~filters.COMMAND, got_image
             )],
             ASK_DIALOGUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_dialogue)],
+            ASK_QUALITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_quality)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("balance", balance))
     app.add_handler(conv)
     log.info("Bot starting (long-polling)…")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
