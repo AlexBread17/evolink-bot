@@ -6,8 +6,12 @@ Flow per video:
   2. Bot asks for an image     -> you send a photo
   3. Bot asks for the dialogue -> you type just the spoken line
   4. Bot asks the quality      -> you tap 480p or 720p
-  5. Bot drops your line into the fixed prompt template, uploads the image,
-     generates, and sends the video back
+  5. Bot shows a review screen -> you tap ✅ Generate (or ⬅️ Back to change something)
+  6. Bot drops your line into the fixed prompt template, uploads the image,
+     generates, and sends the video back (with credits used + remaining)
+
+Every step has ⬅️ Back (to the previous step) and ❌ Cancel. Nothing is sent to
+EvoLink until you tap ✅ Generate on the review screen.
 
 The prompt is a fixed template (see PROMPT_TEMPLATE); only the dialogue line and
 the image change each time. Duration, aspect ratio, quality and the content
@@ -79,19 +83,38 @@ POLL_TIMEOUT = 600        # 10 min
 TG_UPLOAD_LIMIT = 50 * 1024 * 1024
 
 # Conversation states
-ASK_IMAGE, ASK_DIALOGUE, ASK_QUALITY = range(3)
+ASK_IMAGE, ASK_DIALOGUE, ASK_QUALITY, CONFIRM = range(4)
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO
 )
 log = logging.getLogger("evolink-bot")
 
-MAIN_KEYBOARD = ReplyKeyboardMarkup(
-    [["🎬 New video"]], resize_keyboard=True, one_time_keyboard=False
-)
+# Button label constants (so the code and the matchers never drift apart)
+BTN_NEW = "🎬 New video"
+BTN_BACK = "⬅️ Back"
+BTN_CANCEL = "❌ Cancel"
+BTN_GENERATE = "✅ Generate"
 
+MAIN_KEYBOARD = ReplyKeyboardMarkup(
+    [[BTN_NEW]], resize_keyboard=True, one_time_keyboard=False
+)
+# At the image step there's nothing to go back to, so only Cancel.
+IMAGE_KEYBOARD = ReplyKeyboardMarkup(
+    [[BTN_CANCEL]], resize_keyboard=True, one_time_keyboard=False
+)
+# At dialogue / quality steps, Back returns to the previous step.
+DIALOGUE_KEYBOARD = ReplyKeyboardMarkup(
+    [[BTN_BACK, BTN_CANCEL]], resize_keyboard=True, one_time_keyboard=False
+)
 QUALITY_KEYBOARD = ReplyKeyboardMarkup(
-    [["480p", "720p"]], resize_keyboard=True, one_time_keyboard=True
+    [["480p", "720p"], [BTN_BACK, BTN_CANCEL]],
+    resize_keyboard=True, one_time_keyboard=False
+)
+# Final review screen: generate, go back to change quality, or cancel.
+CONFIRM_KEYBOARD = ReplyKeyboardMarkup(
+    [[BTN_GENERATE], [BTN_BACK, BTN_CANCEL]],
+    resize_keyboard=True, one_time_keyboard=False
 )
 
 
@@ -206,6 +229,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"audio {'on' if GENERATE_AUDIO else 'off'}, "
         f"filter {'off' if not CONTENT_FILTER else 'on'}. "
         "Quality (480p/720p) you pick each time.\n"
+        "At each step you can tap ⬅️ Back or ❌ Cancel. Nothing generates until "
+        "you tap ✅ Generate.\n"
         "Send /balance to check remaining credits.",
         reply_markup=MAIN_KEYBOARD,
     )
@@ -222,11 +247,48 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"💳 {bal:.2f} credits remaining.")
 
 
+# --- small helpers that (re)display each step, so Back can reuse them ---
+async def prompt_image(update: Update):
+    await update.message.reply_text(
+        "Send me the image (as a photo).", reply_markup=IMAGE_KEYBOARD
+    )
+    return ASK_IMAGE
+
+
+async def prompt_dialogue(update: Update):
+    await update.message.reply_text(
+        "Send the dialogue line.", reply_markup=DIALOGUE_KEYBOARD
+    )
+    return ASK_DIALOGUE
+
+
+async def prompt_quality(update: Update):
+    await update.message.reply_text(
+        "Quality? Tap one.", reply_markup=QUALITY_KEYBOARD
+    )
+    return ASK_QUALITY
+
+
+async def prompt_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    d = context.user_data.get("dialogue", "")
+    q = context.user_data.get("quality", "")
+    await update.message.reply_text(
+        "Review:\n"
+        f"• Dialogue: “{d}”\n"
+        f"• Quality: {q}\n"
+        f"• {DURATION}s · {ASPECT_RATIO} · audio "
+        f"{'on' if GENERATE_AUDIO else 'off'}\n\n"
+        "Tap ✅ Generate to create it, ⬅️ Back to change quality, or ❌ Cancel.",
+        reply_markup=CONFIRM_KEYBOARD,
+    )
+    return CONFIRM
+
+
 async def go(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorised(update):
         return ConversationHandler.END
-    await update.message.reply_text("Send me the image (as a photo).")
-    return ASK_IMAGE
+    context.user_data.clear()
+    return await prompt_image(update)
 
 
 async def got_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -248,13 +310,17 @@ async def got_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     img_bytes = bytes(await tg_file.download_as_bytearray())
     context.user_data["image_bytes"] = img_bytes
 
-    await update.message.reply_text("Got it. Now send the dialogue line.")
-    return ASK_DIALOGUE
+    return await prompt_dialogue(update)
 
 
 async def got_dialogue(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorised(update):
         return ConversationHandler.END
+
+    # Back here = return to the image step.
+    if update.message.text == BTN_BACK:
+        context.user_data.pop("image_bytes", None)
+        return await prompt_image(update)
 
     dialogue = (update.message.text or "").strip()
     if not dialogue:
@@ -265,24 +331,48 @@ async def got_dialogue(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dialogue = dialogue.strip("\u201c\u201d\"'")
     context.user_data["dialogue"] = dialogue
 
-    await update.message.reply_text("Quality? Tap one.", reply_markup=QUALITY_KEYBOARD)
-    return ASK_QUALITY
+    return await prompt_quality(update)
 
 
 async def got_quality(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorised(update):
         return ConversationHandler.END
 
+    # Back here = return to the dialogue step.
+    if update.message.text == BTN_BACK:
+        context.user_data.pop("dialogue", None)
+        return await prompt_dialogue(update)
+
     quality = (update.message.text or "").strip()
     if quality not in ("480p", "720p"):
         await update.message.reply_text("Tap 480p or 720p.", reply_markup=QUALITY_KEYBOARD)
         return ASK_QUALITY
 
+    context.user_data["quality"] = quality
+    return await prompt_confirm(update, context)
+
+
+async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not authorised(update):
+        return ConversationHandler.END
+
+    # Back here = return to the quality step.
+    if update.message.text == BTN_BACK:
+        context.user_data.pop("quality", None)
+        return await prompt_quality(update)
+
+    if update.message.text != BTN_GENERATE:
+        # Anything other than Generate/Back/Cancel: re-show the review screen.
+        return await prompt_confirm(update, context)
+
     dialogue = context.user_data.get("dialogue")
+    quality = context.user_data.get("quality")
     img_bytes = context.user_data.get("image_bytes")
-    if not dialogue or not img_bytes:
-        await update.message.reply_text("Lost the details — let's restart. Tap “🎬 New video”.",
-                                        reply_markup=MAIN_KEYBOARD)
+    if not dialogue or not quality or not img_bytes:
+        await update.message.reply_text(
+            "Lost the details — let's restart. Tap “🎬 New video”.",
+            reply_markup=MAIN_KEYBOARD,
+        )
         return ConversationHandler.END
 
     prompt = PROMPT_TEMPLATE.format(dialogue=dialogue)
@@ -325,8 +415,7 @@ async def got_quality(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("generation failed")
         await status_msg.edit_text(f"Failed: {e}")
     finally:
-        context.user_data.pop("image_bytes", None)
-        context.user_data.pop("dialogue", None)
+        context.user_data.clear()
 
     await update.message.reply_text("Done. Tap “🎬 New video” for another.",
                                     reply_markup=MAIN_KEYBOARD)
@@ -334,8 +423,7 @@ async def got_quality(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.pop("image_bytes", None)
-    context.user_data.pop("dialogue", None)
+    context.user_data.clear()
     await update.message.reply_text("Cancelled.", reply_markup=MAIN_KEYBOARD)
     return ConversationHandler.END
 
@@ -343,19 +431,30 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
+    cancel_filter = filters.Regex(f"^{BTN_CANCEL}$")
     conv = ConversationHandler(
         entry_points=[
             CommandHandler("go", go),
-            MessageHandler(filters.Regex("^🎬 New video$"), go),
+            MessageHandler(filters.Regex(f"^{BTN_NEW}$"), go),
         ],
         states={
             ASK_IMAGE: [MessageHandler(
                 (filters.PHOTO | filters.Document.IMAGE) & ~filters.COMMAND, got_image
             )],
-            ASK_DIALOGUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_dialogue)],
-            ASK_QUALITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_quality)],
+            ASK_DIALOGUE: [MessageHandler(
+                filters.TEXT & ~filters.COMMAND & ~cancel_filter, got_dialogue
+            )],
+            ASK_QUALITY: [MessageHandler(
+                filters.TEXT & ~filters.COMMAND & ~cancel_filter, got_quality
+            )],
+            CONFIRM: [MessageHandler(
+                filters.TEXT & ~filters.COMMAND & ~cancel_filter, confirm
+            )],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            MessageHandler(cancel_filter, cancel),
+        ],
     )
 
     app.add_handler(CommandHandler("start", start))
