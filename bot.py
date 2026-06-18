@@ -277,6 +277,32 @@ async def say(update, context, text, keyboard=None):
     return msg
 
 
+async def clear_close(update, context):
+    """Delete the lingering closing message (if any) as a new flow starts."""
+    prev = context.chat_data.get("last_close_id")
+    if prev:
+        try:
+            await context.bot.delete_message(update.effective_chat.id, prev)
+        except Exception:  # noqa: BLE001
+            pass
+        context.chat_data["last_close_id"] = None
+
+
+async def close_msg(update, context, text):
+    """Send a 'closing' message (Done / Cancelled / Saved / Back to menu) and
+    delete the PREVIOUS closing message, so at most one ever lingers. Stored in
+    chat_data because it must survive user_data.clear() between conversations."""
+    prev = context.chat_data.get("last_close_id")
+    if prev:
+        try:
+            await context.bot.delete_message(update.effective_chat.id, prev)
+        except Exception:  # noqa: BLE001
+            pass
+    msg = await update.message.reply_text(text, reply_markup=MAIN_KEYBOARD)
+    context.chat_data["last_close_id"] = msg.message_id
+    return msg
+
+
 # ---------------------------------------------------------------------------
 # Generation core (shared by all modes)
 # ---------------------------------------------------------------------------
@@ -360,6 +386,7 @@ async def quick_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorised(update):
         return ConversationHandler.END
     context.user_data.clear()
+    await clear_close(update, context)
     if not load_default_image():
         await update.message.reply_text(
             "No default image yet. Set one in ⚙️ Settings first.",
@@ -401,16 +428,14 @@ async def quick_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     image_url = load_default_image()
     if not dialogue or not image_url:
         await cleanup(update, context)
-        await update.message.reply_text("Lost the details — start again.",
-                                        reply_markup=MAIN_KEYBOARD)
+        await close_msg(update, context, "Lost the details — start again.")
         return ConversationHandler.END
 
     await cleanup(update, context)  # wipe step chatter before sending the video
     prompt = PROMPT_TEMPLATE.format(dialogue=dialogue)
     await run_generation(update, context, prompt=prompt, caption=dialogue,
                          image_url=image_url)
-    await update.message.reply_text("Done. Pick a mode for another.",
-                                    reply_markup=MAIN_KEYBOARD)
+    await close_msg(update, context, "Done. Pick a mode for another.")
     return ConversationHandler.END
 
 
@@ -419,6 +444,7 @@ async def flex_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorised(update):
         return ConversationHandler.END
     context.user_data.clear()
+    await clear_close(update, context)
     track(context, update.message.message_id)
     await say(update, context, "Flexible Mode. Send the image (as a photo).",
               CANCEL_KEYBOARD)
@@ -508,8 +534,7 @@ async def flex_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     img_bytes = context.user_data.get("image_bytes")
     if not text or not mode or not img_bytes:
         await cleanup(update, context)
-        await update.message.reply_text("Lost the details — start again.",
-                                        reply_markup=MAIN_KEYBOARD)
+        await close_msg(update, context, "Lost the details — start again.")
         return ConversationHandler.END
 
     if mode == "dialogue":
@@ -522,8 +547,7 @@ async def flex_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cleanup(update, context)
     await run_generation(update, context, prompt=prompt, caption=caption,
                          image_bytes=img_bytes)
-    await update.message.reply_text("Done. Pick a mode for another.",
-                                    reply_markup=MAIN_KEYBOARD)
+    await close_msg(update, context, "Done. Pick a mode for another.")
     return ConversationHandler.END
 
 
@@ -532,6 +556,7 @@ async def settings_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorised(update):
         return ConversationHandler.END
     context.user_data.clear()
+    await clear_close(update, context)
     track(context, update.message.message_id)
     state = "set ✅" if load_default_image() else "not set ❌"
     await say(update, context,
@@ -548,7 +573,7 @@ async def settings_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if update.message.text == BTN_BACK:
         await cleanup(update, context)
-        await update.message.reply_text("Back to menu.", reply_markup=MAIN_KEYBOARD)
+        await close_msg(update, context, "Back to menu.")
         return ConversationHandler.END
 
     if update.message.text == BTN_SET_IMAGE:
@@ -577,11 +602,9 @@ async def settings_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             url = await upload_image(session, img_bytes)
         save_default_image(url)
         await cleanup(update, context)
-        await update.message.reply_text("✅ Default image saved.",
-                                        reply_markup=MAIN_KEYBOARD)
+        await close_msg(update, context, "✅ Default image saved.")
     except Exception as e:  # noqa: BLE001
-        await update.message.reply_text(f"Couldn't save image: {e}",
-                                        reply_markup=MAIN_KEYBOARD)
+        await close_msg(update, context, f"Couldn't save image: {e}")
     return ConversationHandler.END
 
 
@@ -589,7 +612,7 @@ async def settings_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     track(context, update.message.message_id)
     await cleanup(update, context)
-    await update.message.reply_text("Cancelled.", reply_markup=MAIN_KEYBOARD)
+    await close_msg(update, context, "Cancelled.")
     return ConversationHandler.END
 
 
