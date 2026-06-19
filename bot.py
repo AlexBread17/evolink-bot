@@ -105,6 +105,9 @@ BTN_BACK = "⬅️ Back"
 BTN_CANCEL = "❌ Cancel"
 BTN_GENERATE = "✅ Generate"
 BTN_SET_IMAGE = "🖼️ Set default image"
+BTN_EDIT_PROMPT = "📝 Edit prompt template"
+BTN_VIEW_PROMPT = "👁️ View current template"
+BTN_RESET_PROMPT = "♻️ Reset to default"
 BTN_DIALOGUE = "💬 Dialogue box"
 BTN_FULLPROMPT = "📝 Full prompt"
 
@@ -127,13 +130,15 @@ CONFIRM_KEYBOARD = ReplyKeyboardMarkup(
     resize_keyboard=True, one_time_keyboard=False,
 )
 SETTINGS_KEYBOARD = ReplyKeyboardMarkup(
-    [[BTN_SET_IMAGE], [BTN_BACK]], resize_keyboard=True, one_time_keyboard=False
+    [[BTN_SET_IMAGE], [BTN_EDIT_PROMPT, BTN_VIEW_PROMPT],
+     [BTN_RESET_PROMPT], [BTN_BACK]],
+    resize_keyboard=True, one_time_keyboard=False,
 )
 
 # Conversation states
 (QUICK_DIALOGUE, QUICK_CONFIRM,
  FLEX_IMAGE, FLEX_PROMPTTYPE, FLEX_TEXT, FLEX_CONFIRM,
- SET_IMAGE_WAIT) = range(7)
+ SET_IMAGE_WAIT, EDIT_PROMPT_WAIT) = range(8)
 
 
 def authorised(update: Update) -> bool:
@@ -142,22 +147,49 @@ def authorised(update: Update) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Persistent default-image storage (EvoLink URL only)
+# Persistent state (default image URL + custom prompt template)
 # ---------------------------------------------------------------------------
-def load_default_image() -> str | None:
+def _load_state() -> dict:
     try:
         with open(STATE_FILE, "r") as f:
-            return json.load(f).get("default_image_url")
+            return json.load(f) or {}
     except Exception:  # noqa: BLE001
-        return None
+        return {}
+
+
+def _save_state(state: dict) -> None:
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f)
+    except Exception:  # noqa: BLE001
+        log.warning("could not persist state to %s", STATE_FILE)
+
+
+def load_default_image() -> str | None:
+    return _load_state().get("default_image_url")
 
 
 def save_default_image(url: str) -> None:
-    try:
-        with open(STATE_FILE, "w") as f:
-            json.dump({"default_image_url": url}, f)
-    except Exception:  # noqa: BLE001
-        log.warning("could not persist default image to %s", STATE_FILE)
+    state = _load_state()
+    state["default_image_url"] = url
+    _save_state(state)
+
+
+def load_template() -> str:
+    """Saved custom template if set, else the built-in PROMPT_TEMPLATE."""
+    return _load_state().get("prompt_template") or PROMPT_TEMPLATE
+
+
+def save_template(text: str) -> None:
+    state = _load_state()
+    state["prompt_template"] = text
+    _save_state(state)
+
+
+def reset_template() -> None:
+    state = _load_state()
+    state.pop("prompt_template", None)
+    _save_state(state)
 
 
 # ---------------------------------------------------------------------------
@@ -432,7 +464,7 @@ async def quick_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     await cleanup(update, context)  # wipe step chatter before sending the video
-    prompt = PROMPT_TEMPLATE.format(dialogue=dialogue)
+    prompt = load_template().format(dialogue=dialogue)
     await run_generation(update, context, prompt=prompt, caption=dialogue,
                          image_url=image_url)
     await close_msg(update, context, "Done. Pick a mode for another.")
@@ -538,7 +570,7 @@ async def flex_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     if mode == "dialogue":
-        prompt = PROMPT_TEMPLATE.format(dialogue=text)
+        prompt = load_template().format(dialogue=text)
         caption = text                      # dialogue shown
     else:
         prompt = text
@@ -558,9 +590,13 @@ async def settings_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await clear_close(update, context)
     track(context, update.message.message_id)
-    state = "set ✅" if load_default_image() else "not set ❌"
+    img_state = "set ✅" if load_default_image() else "not set ❌"
+    tpl_state = "custom ✅" if _load_state().get("prompt_template") else "default"
     await say(update, context,
-              f"Settings. Quick Mode default image: {state}.",
+              f"Settings.\n• Quick Mode default image: {img_state}\n"
+              f"• Prompt template: {tpl_state}\n\n"
+              "🖼️ set the image · 📝 edit the template · 👁️ view it · "
+              "♻️ reset to default.",
               SETTINGS_KEYBOARD)
     return SET_IMAGE_WAIT
 
@@ -580,6 +616,31 @@ async def settings_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await say(update, context, "Send the photo to use as the default.",
                   BACK_CANCEL_KEYBOARD)
         return SET_IMAGE_WAIT
+
+    if update.message.text == BTN_VIEW_PROMPT:
+        # Show the active template as a kept message (not deleted on cleanup),
+        # so you can read/copy it. Re-show the settings menu under it.
+        await update.message.reply_text(
+            "Current template (use {dialogue} where the line goes):\n\n"
+            + load_template()
+        )
+        await say(update, context, "Anything else?", SETTINGS_KEYBOARD)
+        return SET_IMAGE_WAIT
+
+    if update.message.text == BTN_RESET_PROMPT:
+        reset_template()
+        await say(update, context, "♻️ Template reset to the built-in default.",
+                  SETTINGS_KEYBOARD)
+        return SET_IMAGE_WAIT
+
+    if update.message.text == BTN_EDIT_PROMPT:
+        await say(update, context,
+                  "Send the new prompt template as one message.\n"
+                  "It MUST contain {dialogue} where the spoken line should go "
+                  "(curly braces, lowercase). Example ending:\n"
+                  'Dialogue: \u201c{dialogue}\u201d',
+                  BACK_CANCEL_KEYBOARD)
+        return EDIT_PROMPT_WAIT
 
     # A photo: upload to EvoLink once, store the URL.
     file_id = None
@@ -605,6 +666,40 @@ async def settings_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await close_msg(update, context, "✅ Default image saved.")
     except Exception as e:  # noqa: BLE001
         await close_msg(update, context, f"Couldn't save image: {e}")
+    return ConversationHandler.END
+
+
+async def edit_prompt_wait(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receive a new prompt template; require a {dialogue} placeholder."""
+    if not authorised(update):
+        return ConversationHandler.END
+    track(context, update.message.message_id)
+
+    if update.message.text == BTN_BACK:
+        return await settings_start(update, context)
+
+    text = (update.message.text or "").strip()
+    if "{dialogue}" not in text:
+        await say(update, context,
+                  "That template has no {dialogue} placeholder, so the dialogue "
+                  "line would have nowhere to go. Add {dialogue} and resend, or "
+                  "tap ⬅️ Back.",
+                  BACK_CANCEL_KEYBOARD)
+        return EDIT_PROMPT_WAIT
+
+    # Guard against a malformed template that would crash .format()
+    try:
+        test = text.format(dialogue="TEST")
+    except Exception:  # noqa: BLE001
+        await say(update, context,
+                  "That template has a formatting problem (stray { or } besides "
+                  "{dialogue}). Fix it and resend, or tap ⬅️ Back.",
+                  BACK_CANCEL_KEYBOARD)
+        return EDIT_PROMPT_WAIT
+
+    save_template(text)
+    await cleanup(update, context)
+    await close_msg(update, context, "✅ Prompt template saved.")
     return ConversationHandler.END
 
 
@@ -648,6 +743,7 @@ def main():
             FLEX_TEXT:      [MessageHandler(txt, flex_text)],
             FLEX_CONFIRM:   [MessageHandler(txt, flex_confirm)],
             SET_IMAGE_WAIT: [MessageHandler(img | txt, settings_router)],
+            EDIT_PROMPT_WAIT: [MessageHandler(txt, edit_prompt_wait)],
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
