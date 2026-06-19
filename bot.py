@@ -618,12 +618,12 @@ async def settings_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return SET_IMAGE_WAIT
 
     if update.message.text == BTN_VIEW_PROMPT:
-        # Show the active template as a kept message (not deleted on cleanup),
-        # so you can read/copy it. Re-show the settings menu under it.
-        await update.message.reply_text(
+        # Show the active template, tracked so it clears on Back/Cancel/next action.
+        m = await update.message.reply_text(
             "Current template (use {dialogue} where the line goes):\n\n"
             + load_template()
         )
+        track(context, m.message_id)
         await say(update, context, "Anything else?", SETTINGS_KEYBOARD)
         return SET_IMAGE_WAIT
 
