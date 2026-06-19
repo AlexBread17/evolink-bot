@@ -13,8 +13,14 @@ template. You type only the dialogue line → confirm → video.
 - **💬 Dialogue box** — type only the dialogue (uses the template)
 - **📝 Full prompt** — type the entire prompt yourself
 
-**⚙️ Settings** — set or replace the Quick Mode default image (tap a button and
-send a photo; no commands).
+**⚙️ Settings** — set or replace the Quick Mode default image, and edit the
+prompt template (tap buttons, no commands):
+- **🖼️ Set default image** — send a photo, becomes the Quick Mode image.
+- **📝 Edit prompt template** — send new template text. It must contain
+  `{dialogue}` where the spoken line goes; the bot rejects anything without it
+  so the dialogue box keeps working. Applies to Quick Mode and Flexible→Dialogue.
+- **👁️ View current template** — shows the active template so you can read/copy it.
+- **♻️ Reset to default** — restores the built-in template.
 
 ## Video captions
 - Quick Mode & Flexible→Dialogue: caption = **dialogue line + credits used**.
@@ -54,10 +60,10 @@ Edit the `CONFIG` block at the top of `bot.py` (prompt template, etc.), push to
 GitHub, Railway redeploys. Secrets stay in Railway, never in the code.
 
 ## Notes
-- The default image is stored as an EvoLink file URL in `STATE_FILE`
-  (default `/tmp/evolink_bot_state.json`). On Railway's ephemeral disk this can
-  reset on a fresh deploy — if Quick Mode ever says "no default image", just set
-  it again in Settings (2 taps).
+- The default image **and** your custom prompt template are stored in
+  `STATE_FILE` (default `/tmp/evolink_bot_state.json`). On Railway's ephemeral
+  disk these can reset on a fresh deploy — if so, just set them again in Settings.
+  The built-in template in `bot.py` is the fallback whenever no custom one is saved.
 - Cost at 480p ≈ ~22 credits per 4s clip (varies). Watch the caption's credit line.
 - Telegram bot uploads cap at 50 MB; 4s clips are far under. If one ever exceeds
   it, the bot posts the direct link (kept, not deleted) instead.
