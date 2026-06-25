@@ -4,14 +4,14 @@ EvoLink Seedance 2.0 Fast (image-to-video) Telegram bot.
 Three buttons from the main menu:
 
   ⚡ Quick Mode
-      Fixed default image + fixed prompt template + 480p + 4s.
-      You type ONLY the dialogue line, confirm, and it generates.
+      Fixed default image + fixed prompt template. You type ONLY the dialogue
+      line, confirm, and it generates. Duration/quality/aspect come from Settings.
 
   🎛️ Flexible Mode
       You send an image, then choose how the prompt works:
         💬 Dialogue box  -> type only the dialogue (uses the template)
         📝 Full prompt   -> type the entire prompt yourself
-      Quality is locked to 480p, duration to 4s.
+      Duration, quality and aspect ratio all come from Settings.
 
   ⚙️ Settings
       Set / replace the default image used by Quick Mode (no commands needed).
@@ -53,13 +53,30 @@ ALLOWED_USERS = {
     int(uid) for uid in os.environ.get("ALLOWED_USERS", "").split(",") if uid.strip()
 }
 
-# Fixed generation settings.
+# Generation settings. These are DEFAULTS; the live values are saved in state
+# and changed only via the Settings menu.
 MODEL = "seedance-2.0-fast-image-to-video"
-DURATION = 4              # seconds (locked)
-ASPECT_RATIO = "9:16"     # vertical (locked)
-QUALITY = "480p"          # locked to 480p in both modes
+DEFAULT_DURATION = 4          # seconds
+DEFAULT_ASPECT_RATIO = "9:16" # vertical
+DEFAULT_QUALITY = "480p"
 GENERATE_AUDIO = True
-CONTENT_FILTER = False    # unrestricted in all modes (+10% billing)
+CONTENT_FILTER = False        # unrestricted in all modes (+10% billing)
+
+# Allowed options offered in Settings.
+DURATION_OPTIONS = [4, 6, 8, 10, 15]          # seconds
+QUALITY_OPTIONS = ["480p", "720p"]
+ASPECT_OPTIONS = ["9:16", "16:9", "3:4", "4:3", "1:1", "21:9"]
+# Friendly labels for aspect ratios.
+ASPECT_LABELS = {
+    "9:16": "9:16 vertical",
+    "16:9": "16:9 horizontal",
+    "3:4": "3:4 portrait",
+    "4:3": "4:3 landscape",
+    "1:1": "1:1 square",
+    "21:9": "21:9 cinematic",
+}
+# Rough credits-per-second by quality (for cost hints; actuals vary slightly).
+QUALITY_CREDITS_PER_SEC = {"480p": 5.6, "720p": 13.5}
 
 # Fixed prompt template. {dialogue} is replaced by the line you type.
 PROMPT_TEMPLATE = (
@@ -104,10 +121,13 @@ BTN_SETTINGS = "⚙️ Settings"
 BTN_BACK = "⬅️ Back"
 BTN_CANCEL = "❌ Cancel"
 BTN_GENERATE = "✅ Generate"
-BTN_SET_IMAGE = "🖼️ Set default image"
-BTN_EDIT_PROMPT = "📝 Edit prompt template"
-BTN_VIEW_PROMPT = "👁️ View current template"
-BTN_RESET_PROMPT = "♻️ Reset to default"
+BTN_SET_IMAGE = "🖼️ Image"
+BTN_EDIT_PROMPT = "📝 Edit template"
+BTN_VIEW_PROMPT = "👁️ View template"
+BTN_RESET_PROMPT = "♻️ Reset template"
+BTN_SET_DURATION = "⏱️ Duration"
+BTN_SET_QUALITY = "🎚️ Quality"
+BTN_SET_ASPECT = "📐 Aspect ratio"
 BTN_DIALOGUE = "💬 Dialogue box"
 BTN_FULLPROMPT = "📝 Full prompt"
 
@@ -130,15 +150,31 @@ CONFIRM_KEYBOARD = ReplyKeyboardMarkup(
     resize_keyboard=True, one_time_keyboard=False,
 )
 SETTINGS_KEYBOARD = ReplyKeyboardMarkup(
-    [[BTN_SET_IMAGE], [BTN_EDIT_PROMPT, BTN_VIEW_PROMPT],
-     [BTN_RESET_PROMPT], [BTN_BACK]],
+    [[BTN_SET_DURATION, BTN_SET_QUALITY, BTN_SET_ASPECT],
+     [BTN_SET_IMAGE, BTN_EDIT_PROMPT],
+     [BTN_VIEW_PROMPT, BTN_RESET_PROMPT],
+     [BTN_BACK]],
+    resize_keyboard=True, one_time_keyboard=False,
+)
+# Pickers (built dynamically from the option lists).
+DURATION_KEYBOARD = ReplyKeyboardMarkup(
+    [[f"{d}s" for d in DURATION_OPTIONS], [BTN_BACK]],
+    resize_keyboard=True, one_time_keyboard=False,
+)
+QUALITY_KEYBOARD = ReplyKeyboardMarkup(
+    [QUALITY_OPTIONS, [BTN_BACK]],
+    resize_keyboard=True, one_time_keyboard=False,
+)
+ASPECT_KEYBOARD = ReplyKeyboardMarkup(
+    [ASPECT_OPTIONS[:3], ASPECT_OPTIONS[3:], [BTN_BACK]],
     resize_keyboard=True, one_time_keyboard=False,
 )
 
 # Conversation states
 (QUICK_DIALOGUE, QUICK_CONFIRM,
  FLEX_IMAGE, FLEX_PROMPTTYPE, FLEX_TEXT, FLEX_CONFIRM,
- SET_IMAGE_WAIT, EDIT_PROMPT_WAIT) = range(8)
+ SET_IMAGE_WAIT, EDIT_PROMPT_WAIT,
+ PICK_DURATION, PICK_QUALITY, PICK_ASPECT) = range(11)
 
 
 def authorised(update: Update) -> bool:
@@ -192,6 +228,39 @@ def reset_template() -> None:
     _save_state(state)
 
 
+def get_duration() -> int:
+    val = _load_state().get("duration")
+    return val if val in DURATION_OPTIONS else DEFAULT_DURATION
+
+
+def set_duration(seconds: int) -> None:
+    state = _load_state()
+    state["duration"] = seconds
+    _save_state(state)
+
+
+def get_quality() -> str:
+    val = _load_state().get("quality")
+    return val if val in QUALITY_OPTIONS else DEFAULT_QUALITY
+
+
+def set_quality(q: str) -> None:
+    state = _load_state()
+    state["quality"] = q
+    _save_state(state)
+
+
+def get_aspect() -> str:
+    val = _load_state().get("aspect_ratio")
+    return val if val in ASPECT_OPTIONS else DEFAULT_ASPECT_RATIO
+
+
+def set_aspect(a: str) -> None:
+    state = _load_state()
+    state["aspect_ratio"] = a
+    _save_state(state)
+
+
 # ---------------------------------------------------------------------------
 # EvoLink calls  (unchanged, proven)
 # ---------------------------------------------------------------------------
@@ -211,14 +280,14 @@ async def upload_image(session: aiohttp.ClientSession, img_bytes: bytes,
 
 
 async def submit_job(session: aiohttp.ClientSession, prompt: str,
-                     image_url: str, quality: str = QUALITY) -> str:
+                     image_url: str) -> str:
     payload = {
         "model": MODEL,
         "prompt": prompt,
         "image_urls": [image_url],
-        "duration": DURATION,
-        "quality": quality,
-        "aspect_ratio": ASPECT_RATIO,
+        "duration": get_duration(),
+        "quality": get_quality(),
+        "aspect_ratio": get_aspect(),
         "generate_audio": GENERATE_AUDIO,
         "content_filter": CONTENT_FILTER,
     }
@@ -353,7 +422,7 @@ async def run_generation(update, context, *, prompt, caption, image_url=None,
             if image_url is None:
                 image_url = await upload_image(session, image_bytes)
             await status.edit_text("Generating… 1–3 min.")
-            task_id = await submit_job(session, prompt, image_url, QUALITY)
+            task_id = await submit_job(session, prompt, image_url)
             await status.edit_text(f"Working… (task {task_id[:18]})")
             video_url = await poll_job(session, task_id)
             data, size = await fetch_bytes(session, video_url)
@@ -407,8 +476,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Pick a mode:\n"
         f"⚡ Quick — type only the dialogue (uses your default image; set: {has_img}).\n"
         "🎛️ Flexible — choose an image, then dialogue box or full prompt.\n"
-        "⚙️ Settings — set the Quick Mode default image.\n\n"
-        "All clips are 480p · 4s · 9:16. Step messages auto-clear; videos stay.",
+        "⚙️ Settings — duration, quality, aspect, image, template.\n\n"
+        f"Current: {get_quality()} · {get_duration()}s · {get_aspect()}. "
+        "Step messages auto-clear; videos stay.",
         reply_markup=MAIN_KEYBOARD,
     )
 
@@ -584,21 +654,40 @@ async def flex_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------- SETTINGS ----------
+def settings_overview_text() -> str:
+    img = "set ✅" if load_default_image() else "not set ❌"
+    tpl = "custom" if _load_state().get("prompt_template") else "default"
+    dur = get_duration()
+    qual = get_quality()
+    asp = ASPECT_LABELS.get(get_aspect(), get_aspect())
+    cps = QUALITY_CREDITS_PER_SEC.get(qual, 0)
+    est = dur * cps
+    return (
+        "⚙️ Settings — current setup\n"
+        "──────────────\n"
+        f"⏱️ Duration  :  {dur}s\n"
+        f"🎚️ Quality   :  {qual}\n"
+        f"📐 Aspect    :  {ASPECT_LABELS.get(get_aspect(), get_aspect())}\n"
+        f"🖼️ Image     :  {img}\n"
+        f"📝 Template  :  {tpl}\n"
+        "──────────────\n"
+        f"≈ {est:.0f} credits per clip at these settings.\n\n"
+        "Tap a button to change it."
+    )
+
+
+async def show_settings(update, context):
+    await say(update, context, settings_overview_text(), SETTINGS_KEYBOARD)
+    return SET_IMAGE_WAIT
+
+
 async def settings_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorised(update):
         return ConversationHandler.END
     context.user_data.clear()
     await clear_close(update, context)
     track(context, update.message.message_id)
-    img_state = "set ✅" if load_default_image() else "not set ❌"
-    tpl_state = "custom ✅" if _load_state().get("prompt_template") else "default"
-    await say(update, context,
-              f"Settings.\n• Quick Mode default image: {img_state}\n"
-              f"• Prompt template: {tpl_state}\n\n"
-              "🖼️ set the image · 📝 edit the template · 👁️ view it · "
-              "♻️ reset to default.",
-              SETTINGS_KEYBOARD)
-    return SET_IMAGE_WAIT
+    return await show_settings(update, context)
 
 
 async def settings_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -611,6 +700,29 @@ async def settings_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cleanup(update, context)
         await close_msg(update, context, "Back to menu.")
         return ConversationHandler.END
+
+    if update.message.text == BTN_SET_DURATION:
+        await say(update, context,
+                  f"Pick clip length (current: {get_duration()}s).",
+                  DURATION_KEYBOARD)
+        return PICK_DURATION
+
+    if update.message.text == BTN_SET_QUALITY:
+        hints = " · ".join(
+            f"{q} ≈{QUALITY_CREDITS_PER_SEC.get(q,0):.1f} cr/s" for q in QUALITY_OPTIONS
+        )
+        await say(update, context,
+                  f"Pick quality (current: {get_quality()}).\n{hints}",
+                  QUALITY_KEYBOARD)
+        return PICK_QUALITY
+
+    if update.message.text == BTN_SET_ASPECT:
+        legend = "\n".join(f"• {a} — {ASPECT_LABELS[a].split(' ',1)[1]}"
+                           for a in ASPECT_OPTIONS)
+        await say(update, context,
+                  f"Pick aspect ratio (current: {get_aspect()}).\n{legend}",
+                  ASPECT_KEYBOARD)
+        return PICK_ASPECT
 
     if update.message.text == BTN_SET_IMAGE:
         await say(update, context, "Send the photo to use as the default.",
@@ -631,7 +743,7 @@ async def settings_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reset_template()
         await say(update, context, "♻️ Template reset to the built-in default.",
                   SETTINGS_KEYBOARD)
-        return SET_IMAGE_WAIT
+        return await show_settings(update, context)
 
     if update.message.text == BTN_EDIT_PROMPT:
         await say(update, context,
@@ -703,6 +815,49 @@ async def edit_prompt_wait(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+async def pick_duration(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not authorised(update):
+        return ConversationHandler.END
+    track(context, update.message.message_id)
+    if update.message.text == BTN_BACK:
+        return await show_settings(update, context)
+    raw = (update.message.text or "").strip().rstrip("s")
+    if not raw.isdigit() or int(raw) not in DURATION_OPTIONS:
+        await say(update, context, "Tap one of the durations, or ⬅️ Back.",
+                  DURATION_KEYBOARD)
+        return PICK_DURATION
+    set_duration(int(raw))
+    return await show_settings(update, context)
+
+
+async def pick_quality(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not authorised(update):
+        return ConversationHandler.END
+    track(context, update.message.message_id)
+    if update.message.text == BTN_BACK:
+        return await show_settings(update, context)
+    q = (update.message.text or "").strip()
+    if q not in QUALITY_OPTIONS:
+        await say(update, context, "Tap 480p or 720p, or ⬅️ Back.", QUALITY_KEYBOARD)
+        return PICK_QUALITY
+    set_quality(q)
+    return await show_settings(update, context)
+
+
+async def pick_aspect(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not authorised(update):
+        return ConversationHandler.END
+    track(context, update.message.message_id)
+    if update.message.text == BTN_BACK:
+        return await show_settings(update, context)
+    a = (update.message.text or "").strip()
+    if a not in ASPECT_OPTIONS:
+        await say(update, context, "Tap one of the ratios, or ⬅️ Back.", ASPECT_KEYBOARD)
+        return PICK_ASPECT
+    set_aspect(a)
+    return await show_settings(update, context)
+
+
 # ---------- shared cancel ----------
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     track(context, update.message.message_id)
@@ -744,6 +899,9 @@ def main():
             FLEX_CONFIRM:   [MessageHandler(txt, flex_confirm)],
             SET_IMAGE_WAIT: [MessageHandler(img | txt, settings_router)],
             EDIT_PROMPT_WAIT: [MessageHandler(txt, edit_prompt_wait)],
+            PICK_DURATION: [MessageHandler(txt, pick_duration)],
+            PICK_QUALITY: [MessageHandler(txt, pick_quality)],
+            PICK_ASPECT: [MessageHandler(txt, pick_aspect)],
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
