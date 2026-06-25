@@ -115,21 +115,21 @@ logging.basicConfig(
 log = logging.getLogger("evolink-bot")
 
 # ---- Button labels (single source of truth) ----
-BTN_QUICK = "⚡ Quick Mode"
-BTN_FLEX = "🎛️ Flexible Mode"
+BTN_QUICK = "⚡ Quick"
+BTN_FLEX = "🎛️ Flex"
 BTN_SETTINGS = "⚙️ Settings"
 BTN_BACK = "⬅️ Back"
 BTN_CANCEL = "❌ Cancel"
-BTN_GENERATE = "✅ Generate"
+BTN_GENERATE = "✅ Go"
 BTN_SET_IMAGE = "🖼️ Image"
-BTN_EDIT_PROMPT = "📝 Edit template"
-BTN_VIEW_PROMPT = "👁️ View template"
-BTN_RESET_PROMPT = "♻️ Reset template"
-BTN_SET_DURATION = "⏱️ Duration"
+BTN_EDIT_PROMPT = "📝 Edit"
+BTN_VIEW_PROMPT = "👁️ View"
+BTN_RESET_PROMPT = "♻️ Reset"
+BTN_SET_DURATION = "⏱️ Length"
 BTN_SET_QUALITY = "🎚️ Quality"
-BTN_SET_ASPECT = "📐 Aspect ratio"
-BTN_DIALOGUE = "💬 Dialogue box"
-BTN_FULLPROMPT = "📝 Full prompt"
+BTN_SET_ASPECT = "📐 Aspect"
+BTN_DIALOGUE = "💬 Dialogue"
+BTN_FULLPROMPT = "📝 Prompt"
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [[BTN_QUICK, BTN_FLEX], [BTN_SETTINGS]],
@@ -522,7 +522,8 @@ async def quick_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await say(update, context, "Type the dialogue line.", CANCEL_KEYBOARD)
         return QUICK_DIALOGUE
     if update.message.text != BTN_GENERATE:
-        await say(update, context, "Tap ✅ Generate, ⬅️ Back, or ❌ Cancel.",
+        await say(update, context,
+                  f"Tap {BTN_GENERATE}, {BTN_BACK}, or {BTN_CANCEL}.",
                   CONFIRM_KEYBOARD)
         return QUICK_CONFIRM
 
@@ -588,7 +589,7 @@ async def flex_prompttype(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["mode"] = "full"
         await say(update, context, "Type the full prompt.", BACK_CANCEL_KEYBOARD)
         return FLEX_TEXT
-    await say(update, context, "Tap 💬 Dialogue box or 📝 Full prompt.",
+    await say(update, context, f"Tap {BTN_DIALOGUE} or {BTN_FULLPROMPT}.",
               PROMPTTYPE_KEYBOARD)
     return FLEX_PROMPTTYPE
 
@@ -627,7 +628,8 @@ async def flex_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await say(update, context, f"Type the {label}.", BACK_CANCEL_KEYBOARD)
         return FLEX_TEXT
     if update.message.text != BTN_GENERATE:
-        await say(update, context, "Tap ✅ Generate, ⬅️ Back, or ❌ Cancel.",
+        await say(update, context,
+                  f"Tap {BTN_GENERATE}, {BTN_BACK}, or {BTN_CANCEL}.",
                   CONFIRM_KEYBOARD)
         return FLEX_CONFIRM
 
