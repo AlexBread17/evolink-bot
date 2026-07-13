@@ -59,12 +59,14 @@ MODEL = "seedance-2.0-fast-image-to-video"
 DEFAULT_DURATION = 4          # seconds
 DEFAULT_ASPECT_RATIO = "9:16" # vertical
 DEFAULT_QUALITY = "480p"
+DEFAULT_COUNT = 1
 GENERATE_AUDIO = True
 CONTENT_FILTER = False        # unrestricted in all modes (+10% billing)
 
 # Allowed options offered in Settings.
 DURATION_OPTIONS = [4, 6, 8, 10, 15]          # seconds
 QUALITY_OPTIONS = ["480p", "720p"]
+COUNT_OPTIONS = [1, 2]                          # videos per submit
 ASPECT_OPTIONS = ["9:16", "16:9", "3:4", "4:3", "1:1", "21:9"]
 # Friendly labels for aspect ratios.
 ASPECT_LABELS = {
@@ -128,6 +130,7 @@ BTN_RESET_PROMPT = "♻️ Reset"
 BTN_SET_DURATION = "⏱️ Length"
 BTN_SET_QUALITY = "🎚️ Quality"
 BTN_SET_ASPECT = "📐 Aspect"
+BTN_SET_COUNT = "🔢 Count"
 BTN_DIALOGUE = "💬 Dialogue"
 BTN_FULLPROMPT = "📝 Prompt"
 
@@ -151,8 +154,8 @@ CONFIRM_KEYBOARD = ReplyKeyboardMarkup(
 )
 SETTINGS_KEYBOARD = ReplyKeyboardMarkup(
     [[BTN_SET_DURATION, BTN_SET_QUALITY, BTN_SET_ASPECT],
-     [BTN_SET_IMAGE, BTN_EDIT_PROMPT],
-     [BTN_VIEW_PROMPT, BTN_RESET_PROMPT],
+     [BTN_SET_COUNT, BTN_SET_IMAGE],
+     [BTN_EDIT_PROMPT, BTN_VIEW_PROMPT, BTN_RESET_PROMPT],
      [BTN_BACK]],
     resize_keyboard=True, one_time_keyboard=False,
 )
@@ -169,12 +172,16 @@ ASPECT_KEYBOARD = ReplyKeyboardMarkup(
     [ASPECT_OPTIONS[:3], ASPECT_OPTIONS[3:], [BTN_BACK]],
     resize_keyboard=True, one_time_keyboard=False,
 )
+COUNT_KEYBOARD = ReplyKeyboardMarkup(
+    [[str(c) for c in COUNT_OPTIONS], [BTN_BACK]],
+    resize_keyboard=True, one_time_keyboard=False,
+)
 
 # Conversation states
 (QUICK_DIALOGUE, QUICK_CONFIRM,
  FLEX_IMAGE, FLEX_PROMPTTYPE, FLEX_TEXT, FLEX_CONFIRM,
  SET_IMAGE_WAIT, EDIT_PROMPT_WAIT,
- PICK_DURATION, PICK_QUALITY, PICK_ASPECT) = range(11)
+ PICK_DURATION, PICK_QUALITY, PICK_ASPECT, PICK_COUNT) = range(12)
 
 
 def authorised(update: Update) -> bool:
@@ -258,6 +265,17 @@ def get_aspect() -> str:
 def set_aspect(a: str) -> None:
     state = _load_state()
     state["aspect_ratio"] = a
+    _save_state(state)
+
+
+def get_count() -> int:
+    val = _load_state().get("count")
+    return val if val in COUNT_OPTIONS else DEFAULT_COUNT
+
+
+def set_count(n: int) -> None:
+    state = _load_state()
+    state["count"] = n
     _save_state(state)
 
 
@@ -409,56 +427,69 @@ async def close_msg(update, context, text):
 # ---------------------------------------------------------------------------
 async def run_generation(update, context, *, prompt, caption, image_url=None,
                          image_bytes=None):
-    """Upload (if needed), generate, send the video with the given caption.
+    """Upload (if needed), generate COUNT clip(s), send each with the caption.
 
-    Exactly one of image_url / image_bytes must be provided. The status message
-    is tracked + deleted; the final video is NOT tracked (stays in chat).
+    Count comes from the saved setting (1 or 2). The image is uploaded once and
+    reused for both jobs. Each clip is an independent generation (its own roll).
+    Status messages are tracked+deleted; finished videos are NOT (they stay).
     """
-    status = await update.message.reply_text("Uploading…")
+    count = get_count()
+    status = await update.message.reply_text(
+        "Uploading…" if count == 1 else f"Uploading… (making {count} clips)"
+    )
     timeout = aiohttp.ClientTimeout(total=POLL_TIMEOUT + 120)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             credits_before = await get_credits(session)
             if image_url is None:
                 image_url = await upload_image(session, image_bytes)
-            await status.edit_text("Generating… 1–3 min.")
-            task_id = await submit_job(session, prompt, image_url)
-            await status.edit_text(f"Working… (task {task_id[:18]})")
-            video_url = await poll_job(session, task_id)
-            data, size = await fetch_bytes(session, video_url)
 
+            any_sent = False
+            for i in range(count):
+                tag = "" if count == 1 else f" {i+1}/{count}"
+                await status.edit_text(f"Generating{tag}… 1–3 min.")
+                try:
+                    task_id = await submit_job(session, prompt, image_url)
+                    await status.edit_text(f"Working{tag}… (task {task_id[:18]})")
+                    video_url = await poll_job(session, task_id)
+                    data, size = await fetch_bytes(session, video_url)
+                except Exception as e:  # noqa: BLE001 - one clip failing shouldn't kill the rest
+                    log.exception("clip %d failed", i + 1)
+                    await update.message.reply_text(f"Clip{tag} failed: {e}")
+                    continue
+
+                # Caption: dialogue (if any) + a per-clip tag when making 2.
+                base = f"{caption}{tag}" if caption else tag.strip()
+                if data is None:
+                    await update.message.reply_text(
+                        f"Video{tag} is {size/1_048_576:.1f} MB — too big for Telegram.\n"
+                        f"Link (expires 24h, save now):\n{video_url}"
+                    )
+                else:
+                    await update.message.reply_video(
+                        video=data, caption=(base or None),
+                        supports_streaming=True,
+                    )
+                any_sent = True
+
+            # One credit summary for the whole submit (before/after difference).
             credits_after = await get_credits(session)
             if credits_after is not None and credits_before is not None:
                 used = max(credits_before - credits_after, 0)
-                credit_line = f"💳 Used {used:.2f} credits · {credits_after:.2f} left"
+                summary = f"💳 Used {used:.2f} credits · {credits_after:.2f} left"
             elif credits_after is not None:
-                credit_line = f"💳 {credits_after:.2f} credits left"
+                summary = f"💳 {credits_after:.2f} credits left"
             else:
-                credit_line = ""
-
-            full_caption = (f"{caption}\n{credit_line}".strip()
-                            if caption else credit_line)
-
-            if data is None:
-                # Too big to upload: send the link as a NORMAL (kept) message.
-                await update.message.reply_text(
-                    f"Video is {size/1_048_576:.1f} MB — too big for Telegram.\n"
-                    f"Link (expires 24h, save now):\n{video_url}\n{credit_line}"
-                )
-            else:
-                # The video is sent UNtracked => never deleted.
-                await update.message.reply_video(
-                    video=data, caption=full_caption or None,
-                    supports_streaming=True,
-                )
-            return True
+                summary = ""
+            if summary:
+                # Kept message (untracked) so the running cost stays visible.
+                await update.message.reply_text(summary)
+            return any_sent
     except Exception as e:  # noqa: BLE001
         log.exception("generation failed")
-        # keep the error visible (untracked) so the user sees what happened
         await update.message.reply_text(f"Failed: {e}")
         return False
     finally:
-        # Remove the "Uploading/Generating" status line specifically.
         try:
             await status.delete()
         except Exception:  # noqa: BLE001
@@ -661,19 +692,21 @@ def settings_overview_text() -> str:
     tpl = "custom" if _load_state().get("prompt_template") else "default"
     dur = get_duration()
     qual = get_quality()
-    asp = ASPECT_LABELS.get(get_aspect(), get_aspect())
+    cnt = get_count()
     cps = QUALITY_CREDITS_PER_SEC.get(qual, 0)
-    est = dur * cps
+    est = dur * cps * cnt
+    per_submit = f" (×{cnt} = {est:.0f} per submit)" if cnt > 1 else ""
     return (
         "⚙️ Settings — current setup\n"
         "──────────────\n"
-        f"⏱️ Duration  :  {dur}s\n"
-        f"🎚️ Quality   :  {qual}\n"
-        f"📐 Aspect    :  {ASPECT_LABELS.get(get_aspect(), get_aspect())}\n"
-        f"🖼️ Image     :  {img}\n"
-        f"📝 Template  :  {tpl}\n"
+        f"⏱️ Length   :  {dur}s\n"
+        f"🎚️ Quality  :  {qual}\n"
+        f"📐 Aspect   :  {ASPECT_LABELS.get(get_aspect(), get_aspect())}\n"
+        f"🔢 Count    :  {cnt} per submit\n"
+        f"🖼️ Image    :  {img}\n"
+        f"📝 Template :  {tpl}\n"
         "──────────────\n"
-        f"≈ {est:.0f} credits per clip at these settings.\n\n"
+        f"≈ {dur*cps:.0f} credits per clip{per_submit}.\n\n"
         "Tap a button to change it."
     )
 
@@ -725,6 +758,13 @@ async def settings_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                   f"Pick aspect ratio (current: {get_aspect()}).\n{legend}",
                   ASPECT_KEYBOARD)
         return PICK_ASPECT
+
+    if update.message.text == BTN_SET_COUNT:
+        await say(update, context,
+                  f"How many clips per ✅ Go? (current: {get_count()})\n"
+                  "2 means two independent variations — and 2× the credits.",
+                  COUNT_KEYBOARD)
+        return PICK_COUNT
 
     if update.message.text == BTN_SET_IMAGE:
         await say(update, context, "Send the photo to use as the default.",
@@ -860,6 +900,20 @@ async def pick_aspect(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await show_settings(update, context)
 
 
+async def pick_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not authorised(update):
+        return ConversationHandler.END
+    track(context, update.message.message_id)
+    if update.message.text == BTN_BACK:
+        return await show_settings(update, context)
+    raw = (update.message.text or "").strip()
+    if not raw.isdigit() or int(raw) not in COUNT_OPTIONS:
+        await say(update, context, "Tap 1 or 2, or ⬅️ Back.", COUNT_KEYBOARD)
+        return PICK_COUNT
+    set_count(int(raw))
+    return await show_settings(update, context)
+
+
 # ---------- shared cancel ----------
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     track(context, update.message.message_id)
@@ -904,6 +958,7 @@ def main():
             PICK_DURATION: [MessageHandler(txt, pick_duration)],
             PICK_QUALITY: [MessageHandler(txt, pick_quality)],
             PICK_ASPECT: [MessageHandler(txt, pick_aspect)],
+            PICK_COUNT: [MessageHandler(txt, pick_count)],
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
