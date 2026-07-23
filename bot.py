@@ -52,10 +52,18 @@ EVOLINK_KEY = os.environ["EVOLINK_API_KEY"]
 ALLOWED_USERS = {
     int(uid) for uid in os.environ.get("ALLOWED_USERS", "").split(",") if uid.strip()
 }
+IMAGE_USERS = {
+    int(uid) for uid in os.environ.get("IMAGE_USERS", "").split(",") if uid.strip()
+}
 
 # Generation settings. These are DEFAULTS; the live values are saved in state
 # and changed only via the Settings menu.
 MODEL = "seedance-2.0-fast-image-to-video"
+IMAGE_MODEL = "doubao-seedream-5.0-pro"
+IMAGE_GEN_URL = "https://api.evolink.ai/v1/images/generations"
+DEFAULT_IMAGE_QUALITY = "1K"
+DEFAULT_IMAGE_SIZE = "auto"
+IMAGE_QUALITY_OPTIONS = ["1K", "2K"]
 DEFAULT_DURATION = 4          # seconds
 DEFAULT_ASPECT_RATIO = "9:16" # vertical
 DEFAULT_QUALITY = "480p"
@@ -119,6 +127,7 @@ log = logging.getLogger("evolink-bot")
 # ---- Button labels (single source of truth) ----
 BTN_QUICK = "⚡ Quick"
 BTN_FLEX = "🎛️ Flex"
+BTN_IMG_EDIT = "🖌️ Edit"
 BTN_SETTINGS = "⚙️ Settings"
 BTN_BACK = "⬅️ Back"
 BTN_CANCEL = "❌ Cancel"
@@ -135,7 +144,11 @@ BTN_DIALOGUE = "💬 Dialogue"
 BTN_FULLPROMPT = "📝 Prompt"
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
-    [[BTN_QUICK, BTN_FLEX], [BTN_SETTINGS]],
+    [[BTN_QUICK, BTN_FLEX], [BTN_IMG_EDIT, BTN_SETTINGS]],
+    resize_keyboard=True, one_time_keyboard=False,
+)
+IMAGE_ONLY_KEYBOARD = ReplyKeyboardMarkup(
+    [[BTN_IMG_EDIT]],
     resize_keyboard=True, one_time_keyboard=False,
 )
 CANCEL_KEYBOARD = ReplyKeyboardMarkup(
@@ -181,12 +194,28 @@ COUNT_KEYBOARD = ReplyKeyboardMarkup(
 (QUICK_DIALOGUE, QUICK_CONFIRM,
  FLEX_IMAGE, FLEX_PROMPTTYPE, FLEX_TEXT, FLEX_CONFIRM,
  SET_IMAGE_WAIT, EDIT_PROMPT_WAIT,
- PICK_DURATION, PICK_QUALITY, PICK_ASPECT, PICK_COUNT) = range(12)
+ PICK_DURATION, PICK_QUALITY, PICK_ASPECT, PICK_COUNT,
+ IMG_EDIT_PHOTO, IMG_EDIT_TEXT, IMG_EDIT_CONFIRM) = range(15)
 
 
 def authorised(update: Update) -> bool:
+    """Full access: video + image modes."""
     user = update.effective_user
     return bool(user) and user.id in ALLOWED_USERS
+
+
+def image_authorised(update: Update) -> bool:
+    """Image edit access: ALLOWED_USERS (full) + IMAGE_USERS (image only)."""
+    user = update.effective_user
+    return bool(user) and user.id in (ALLOWED_USERS | IMAGE_USERS)
+
+
+def get_user_keyboard(update: Update):
+    """Return the right main keyboard for this user's access level."""
+    user = update.effective_user
+    if user and user.id in ALLOWED_USERS:
+        return MAIN_KEYBOARD
+    return IMAGE_ONLY_KEYBOARD
 
 
 # ---------------------------------------------------------------------------
@@ -298,14 +327,15 @@ async def upload_image(session: aiohttp.ClientSession, img_bytes: bytes,
 
 
 async def submit_job(session: aiohttp.ClientSession, prompt: str,
-                     image_url: str) -> str:
+                     image_url: str, *, duration: int, quality: str,
+                     aspect_ratio: str) -> str:
     payload = {
         "model": MODEL,
         "prompt": prompt,
         "image_urls": [image_url],
-        "duration": get_duration(),
-        "quality": get_quality(),
-        "aspect_ratio": get_aspect(),
+        "duration": duration,
+        "quality": quality,
+        "aspect_ratio": aspect_ratio,
         "generate_audio": GENERATE_AUDIO,
         "content_filter": CONTENT_FILTER,
     }
@@ -407,7 +437,7 @@ async def clear_close(update, context):
         context.chat_data["last_close_id"] = None
 
 
-async def close_msg(update, context, text):
+async def close_msg(update, context, text, keyboard=None):
     """Send a 'closing' message (Done / Cancelled / Saved / Back to menu) and
     delete the PREVIOUS closing message, so at most one ever lingers. Stored in
     chat_data because it must survive user_data.clear() between conversations."""
@@ -417,24 +447,23 @@ async def close_msg(update, context, text):
             await context.bot.delete_message(update.effective_chat.id, prev)
         except Exception:  # noqa: BLE001
             pass
-    msg = await update.message.reply_text(text, reply_markup=MAIN_KEYBOARD)
+    kb = keyboard or get_user_keyboard(update)
+    msg = await update.message.reply_text(text, reply_markup=kb)
     context.chat_data["last_close_id"] = msg.message_id
     return msg
 
 
 # ---------------------------------------------------------------------------
-# Generation core (shared by all modes)
+# Generation core (shared by all modes) — runs as background task
 # ---------------------------------------------------------------------------
-async def run_generation(update, context, *, prompt, caption, image_url=None,
-                         image_bytes=None):
+async def run_generation(bot, chat_id, *, prompt, caption, image_url=None,
+                         image_bytes=None, duration, quality, aspect_ratio, count):
     """Upload (if needed), generate COUNT clip(s), send each with the caption.
 
-    Count comes from the saved setting (1 or 2). The image is uploaded once and
-    reused for both jobs. Each clip is an independent generation (its own roll).
-    Status messages are tracked+deleted; finished videos are NOT (they stay).
+    Runs as an asyncio background task — does not block the conversation.
+    Settings are snapshotted at confirm time so mid-generation changes don't leak.
     """
-    count = get_count()
-    status = await update.message.reply_text(
+    status = await bot.send_message(chat_id,
         "Uploading…" if count == 1 else f"Uploading… (making {count} clips)"
     )
     timeout = aiohttp.ClientTimeout(total=POLL_TIMEOUT + 120)
@@ -449,30 +478,29 @@ async def run_generation(update, context, *, prompt, caption, image_url=None,
                 tag = "" if count == 1 else f" {i+1}/{count}"
                 await status.edit_text(f"Generating{tag}… 1–3 min.")
                 try:
-                    task_id = await submit_job(session, prompt, image_url)
+                    task_id = await submit_job(session, prompt, image_url,
+                                              duration=duration, quality=quality,
+                                              aspect_ratio=aspect_ratio)
                     await status.edit_text(f"Working{tag}… (task {task_id[:18]})")
                     video_url = await poll_job(session, task_id)
                     data, size = await fetch_bytes(session, video_url)
-                except Exception as e:  # noqa: BLE001 - one clip failing shouldn't kill the rest
+                except Exception as e:  # noqa: BLE001
                     log.exception("clip %d failed", i + 1)
-                    await update.message.reply_text(f"Clip{tag} failed: {e}")
+                    await bot.send_message(chat_id, f"Clip{tag} failed: {e}")
                     continue
 
-                # Caption: dialogue (if any) + a per-clip tag when making 2.
                 base = f"{caption}{tag}" if caption else tag.strip()
                 if data is None:
-                    await update.message.reply_text(
+                    await bot.send_message(chat_id,
                         f"Video{tag} is {size/1_048_576:.1f} MB — too big for Telegram.\n"
                         f"Link (expires 24h, save now):\n{video_url}"
                     )
                 else:
-                    await update.message.reply_video(
-                        video=data, caption=(base or None),
-                        supports_streaming=True,
-                    )
+                    await bot.send_video(chat_id, video=data,
+                                         caption=(base or None),
+                                         supports_streaming=True)
                 any_sent = True
 
-            # One credit summary for the whole submit (before/after difference).
             credits_after = await get_credits(session)
             if credits_after is not None and credits_before is not None:
                 used = max(credits_before - credits_after, 0)
@@ -482,12 +510,11 @@ async def run_generation(update, context, *, prompt, caption, image_url=None,
             else:
                 summary = ""
             if summary:
-                # Kept message (untracked) so the running cost stays visible.
-                await update.message.reply_text(summary)
+                await bot.send_message(chat_id, summary)
             return any_sent
     except Exception as e:  # noqa: BLE001
         log.exception("generation failed")
-        await update.message.reply_text(f"Failed: {e}")
+        await bot.send_message(chat_id, f"Failed: {e}")
         return False
     finally:
         try:
@@ -497,21 +524,189 @@ async def run_generation(update, context, *, prompt, caption, image_url=None,
 
 
 # ---------------------------------------------------------------------------
+# Image edit generation core
+# ---------------------------------------------------------------------------
+async def submit_image_job(session: aiohttp.ClientSession, prompt: str,
+                           image_url: str) -> str:
+    payload = {
+        "model": IMAGE_MODEL,
+        "prompt": prompt,
+        "image_urls": [image_url],
+        "size": DEFAULT_IMAGE_SIZE,
+        "quality": DEFAULT_IMAGE_QUALITY,
+        "n": 1,
+        "output_format": "jpeg",
+        "watermark": False,
+    }
+    headers = {"Authorization": f"Bearer {EVOLINK_KEY}"}
+    async with session.post(IMAGE_GEN_URL, json=payload, headers=headers) as r:
+        body = await r.json()
+        if r.status == 401:
+            raise RuntimeError("EvoLink rejected the key (401).")
+        if r.status == 402:
+            raise RuntimeError("EvoLink balance too low (402). Top up credits.")
+        if r.status >= 400:
+            raise RuntimeError(f"Image submit error {r.status}: {body}")
+        task_id = body.get("id")
+        if not task_id:
+            raise RuntimeError(f"No task id returned: {body}")
+        return task_id
+
+
+async def run_image_edit(bot, chat_id, *, prompt, image_url=None,
+                         image_bytes=None):
+    """Upload image, submit Seedream edit job, poll, send result photo.
+    Runs as an asyncio background task."""
+    status = await bot.send_message(chat_id, "Uploading…")
+    timeout = aiohttp.ClientTimeout(total=POLL_TIMEOUT + 120)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            credits_before = await get_credits(session)
+            if image_url is None:
+                image_url = await upload_image(session, image_bytes)
+
+            await status.edit_text("Editing image… 10–45s.")
+            task_id = await submit_image_job(session, prompt, image_url)
+            await status.edit_text(f"Working… (task {task_id[:18]})")
+            result_url = await poll_job(session, task_id)
+
+            data, size = await fetch_bytes(session, result_url)
+            if data is None:
+                await bot.send_message(chat_id,
+                    f"Image is {size/1_048_576:.1f} MB — too big for Telegram.\n"
+                    f"Link (expires 24h):\n{result_url}"
+                )
+            else:
+                await bot.send_photo(chat_id, photo=data)
+
+            credits_after = await get_credits(session)
+            if credits_after is not None and credits_before is not None:
+                used = max(credits_before - credits_after, 0)
+                summary = f"💳 Used {used:.2f} credits · {credits_after:.2f} left"
+            elif credits_after is not None:
+                summary = f"💳 {credits_after:.2f} credits left"
+            else:
+                summary = ""
+            if summary:
+                await bot.send_message(chat_id, summary)
+            return True
+    except Exception as e:
+        log.exception("image edit failed")
+        await bot.send_message(chat_id, f"Failed: {e}")
+        return False
+    finally:
+        try:
+            await status.delete()
+        except Exception:
+            pass
+
+
+# ---------- IMAGE EDIT MODE ----------
+async def img_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not image_authorised(update):
+        return ConversationHandler.END
+    context.user_data.clear()
+    await clear_close(update, context)
+    track(context, update.message.message_id)
+    await say(update, context, "Image Edit. Send the photo to edit.",
+              CANCEL_KEYBOARD)
+    return IMG_EDIT_PHOTO
+
+
+async def img_edit_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not image_authorised(update):
+        return ConversationHandler.END
+    track(context, update.message.message_id)
+    file_id = None
+    if update.message.photo:
+        file_id = update.message.photo[-1].file_id
+    elif update.message.document and (update.message.document.mime_type or "").startswith("image/"):
+        file_id = update.message.document.file_id
+    if not file_id:
+        await say(update, context, "That wasn't an image. Send a photo.",
+                  CANCEL_KEYBOARD)
+        return IMG_EDIT_PHOTO
+    tg_file = await context.bot.get_file(file_id)
+    context.user_data["image_bytes"] = bytes(await tg_file.download_as_bytearray())
+    await say(update, context, "Describe the edit (e.g. 'remove background', "
+              "'make her hair blonde', 'add sunglasses').",
+              BACK_CANCEL_KEYBOARD)
+    return IMG_EDIT_TEXT
+
+
+async def img_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not image_authorised(update):
+        return ConversationHandler.END
+    track(context, update.message.message_id)
+    if update.message.text == BTN_BACK:
+        context.user_data.pop("image_bytes", None)
+        await say(update, context, "Send the photo to edit.", CANCEL_KEYBOARD)
+        return IMG_EDIT_PHOTO
+    text = (update.message.text or "").strip()
+    if not text:
+        await say(update, context, "Describe the edit as text.",
+                  BACK_CANCEL_KEYBOARD)
+        return IMG_EDIT_TEXT
+    context.user_data["edit_prompt"] = text
+    await say(update, context, f"Edit: \"{text}\"\nGo?", CONFIRM_KEYBOARD)
+    return IMG_EDIT_CONFIRM
+
+
+async def img_edit_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not image_authorised(update):
+        return ConversationHandler.END
+    track(context, update.message.message_id)
+    if update.message.text == BTN_BACK:
+        await say(update, context, "Describe the edit.",
+                  BACK_CANCEL_KEYBOARD)
+        return IMG_EDIT_TEXT
+    if update.message.text != BTN_GENERATE:
+        await say(update, context,
+                  f"Tap {BTN_GENERATE}, {BTN_BACK}, or {BTN_CANCEL}.",
+                  CONFIRM_KEYBOARD)
+        return IMG_EDIT_CONFIRM
+
+    prompt = context.user_data.get("edit_prompt")
+    img_bytes = context.user_data.get("image_bytes")
+    if not prompt or not img_bytes:
+        await cleanup(update, context)
+        await close_msg(update, context, "Lost the details — start again.")
+        return ConversationHandler.END
+
+    await cleanup(update, context)
+    asyncio.create_task(run_image_edit(
+        context.bot, update.effective_chat.id,
+        prompt=prompt, image_bytes=img_bytes,
+    ))
+    await close_msg(update, context, "⏳ Queued. You can start another.")
+    return ConversationHandler.END
+
+
+# ---------------------------------------------------------------------------
 # Entry points / menu
 # ---------------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not authorised(update):
+    if not image_authorised(update):
         return
-    has_img = "yes" if load_default_image() else "no"
-    await update.message.reply_text(
-        "Pick a mode:\n"
-        f"⚡ Quick — type only the dialogue (uses your default image; set: {has_img}).\n"
-        "🎛️ Flexible — choose an image, then dialogue box or full prompt.\n"
-        "⚙️ Settings — duration, quality, aspect, image, template.\n\n"
-        f"Current: {get_quality()} · {get_duration()}s · {get_aspect()}. "
-        "Step messages auto-clear; videos stay.",
-        reply_markup=MAIN_KEYBOARD,
-    )
+    kb = get_user_keyboard(update)
+    if authorised(update):
+        has_img = "yes" if load_default_image() else "no"
+        await update.message.reply_text(
+            "Pick a mode:\n"
+            f"⚡ Quick — type only the dialogue (uses your default image; set: {has_img}).\n"
+            "🎛️ Flexible — choose an image, then dialogue box or full prompt.\n"
+            "🖌️ Edit — image-to-image editing (Seedream 5.0 Pro).\n"
+            "⚙️ Settings — duration, quality, aspect, image, template.\n\n"
+            f"Current: {get_quality()} · {get_duration()}s · {get_aspect()}. "
+            "Step messages auto-clear; videos stay.",
+            reply_markup=kb,
+        )
+    else:
+        await update.message.reply_text(
+            "🖌️ Edit — send a photo and describe the edit.\n"
+            "Powered by Seedream 5.0 Pro.",
+            reply_markup=kb,
+        )
 
 
 # ---------- QUICK MODE ----------
@@ -565,11 +760,16 @@ async def quick_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await close_msg(update, context, "Lost the details — start again.")
         return ConversationHandler.END
 
-    await cleanup(update, context)  # wipe step chatter before sending the video
+    await cleanup(update, context)
     prompt = load_template().format(dialogue=dialogue)
-    await run_generation(update, context, prompt=prompt, caption=dialogue,
-                         image_url=image_url)
-    await close_msg(update, context, "Done. Pick a mode for another.")
+    # Snapshot settings and fire background task
+    asyncio.create_task(run_generation(
+        context.bot, update.effective_chat.id,
+        prompt=prompt, caption=dialogue, image_url=image_url,
+        duration=get_duration(), quality=get_quality(),
+        aspect_ratio=get_aspect(), count=get_count(),
+    ))
+    await close_msg(update, context, "⏳ Queued. You can start another.")
     return ConversationHandler.END
 
 
@@ -680,9 +880,14 @@ async def flex_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         caption = ""                        # full prompt: credits only, prompt hidden
 
     await cleanup(update, context)
-    await run_generation(update, context, prompt=prompt, caption=caption,
-                         image_bytes=img_bytes)
-    await close_msg(update, context, "Done. Pick a mode for another.")
+    # Snapshot settings and fire background task
+    asyncio.create_task(run_generation(
+        context.bot, update.effective_chat.id,
+        prompt=prompt, caption=caption, image_bytes=img_bytes,
+        duration=get_duration(), quality=get_quality(),
+        aspect_ratio=get_aspect(), count=get_count(),
+    ))
+    await close_msg(update, context, "⏳ Queued. You can start another.")
     return ConversationHandler.END
 
 
@@ -923,7 +1128,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not authorised(update):
+    if not image_authorised(update):
         return
     async with aiohttp.ClientSession() as session:
         bal = await get_credits(session)
@@ -944,6 +1149,7 @@ def main():
         entry_points=[
             MessageHandler(filters.Regex(f"^{BTN_QUICK}$"), quick_start),
             MessageHandler(filters.Regex(f"^{BTN_FLEX}$"), flex_start),
+            MessageHandler(filters.Regex(r"^🖌️ Edit$"), img_edit_start),
             MessageHandler(filters.Regex(f"^{BTN_SETTINGS}$"), settings_start),
         ],
         states={
@@ -959,6 +1165,9 @@ def main():
             PICK_QUALITY: [MessageHandler(txt, pick_quality)],
             PICK_ASPECT: [MessageHandler(txt, pick_aspect)],
             PICK_COUNT: [MessageHandler(txt, pick_count)],
+            IMG_EDIT_PHOTO: [MessageHandler(img | txt, img_edit_photo)],
+            IMG_EDIT_TEXT:  [MessageHandler(txt, img_edit_text)],
+            IMG_EDIT_CONFIRM: [MessageHandler(txt, img_edit_confirm)],
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
