@@ -576,7 +576,7 @@ async def submit_image_job(session: aiohttp.ClientSession, prompt: str,
         "size": img_size,
         "quality": img_quality,
         "n": 1,
-        "output_format": "jpeg",
+        "output_format": "png",
         "watermark": False,
     }
     headers = {"Authorization": f"Bearer {EVOLINK_KEY}"}
