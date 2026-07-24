@@ -54,7 +54,7 @@ EVOLINK_KEY = os.environ["EVOLINK_API_KEY"]
 ALLOWED_USERS = {
     int(uid) for uid in os.environ.get("ALLOWED_USERS", "").split(",") if uid.strip()
 }
-IMAGE_USERS = {
+_ENV_IMAGE_USERS = {
     int(uid) for uid in os.environ.get("IMAGE_USERS", "").split(",") if uid.strip()
 }
 
@@ -157,7 +157,12 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
     resize_keyboard=True, one_time_keyboard=False,
 )
 IMAGE_ONLY_KEYBOARD = ReplyKeyboardMarkup(
-    [[BTN_IMG_EDIT]],
+    [[BTN_IMG_EDIT, BTN_SETTINGS]],
+    resize_keyboard=True, one_time_keyboard=False,
+)
+IMAGE_SETTINGS_KEYBOARD = ReplyKeyboardMarkup(
+    [[BTN_SET_IMG_QUALITY, BTN_SET_IMG_SIZE],
+     [BTN_BACK]],
     resize_keyboard=True, one_time_keyboard=False,
 )
 CANCEL_KEYBOARD = ReplyKeyboardMarkup(
@@ -227,10 +232,33 @@ def authorised(update: Update) -> bool:
     return bool(user) and user.id in ALLOWED_USERS
 
 
+def _get_image_users() -> set[int]:
+    """Merge env var IMAGE_USERS with dynamically granted ones from state."""
+    state = _load_state()
+    granted = set(state.get("image_users", []))
+    return _ENV_IMAGE_USERS | granted
+
+
+def _grant_image_user(uid: int) -> None:
+    state = _load_state()
+    users = set(state.get("image_users", []))
+    users.add(uid)
+    state["image_users"] = list(users)
+    _save_state(state)
+
+
+def _revoke_image_user(uid: int) -> None:
+    state = _load_state()
+    users = set(state.get("image_users", []))
+    users.discard(uid)
+    state["image_users"] = list(users)
+    _save_state(state)
+
+
 def image_authorised(update: Update) -> bool:
     """Image edit access: ALLOWED_USERS (full) + IMAGE_USERS (image only)."""
     user = update.effective_user
-    return bool(user) and user.id in (ALLOWED_USERS | IMAGE_USERS)
+    return bool(user) and user.id in (ALLOWED_USERS | _get_image_users())
 
 
 def get_user_keyboard(update: Update):
@@ -404,18 +432,30 @@ async def poll_job(session: aiohttp.ClientSession, task_id: str) -> str:
     url = TASK_URL.format(task_id=task_id)
     req_timeout = aiohttp.ClientTimeout(total=30)
     waited = 0
+    first = True
     while waited < POLL_TIMEOUT:
         try:
             async with session.get(url, headers=headers, timeout=req_timeout) as r:
+                body_text = await r.text()
                 if r.status != 200:
-                    log.warning("poll %s → HTTP %d", task_id[:18], r.status)
+                    log.warning("poll %s HTTP %d: %s", task_id, r.status, body_text[:300])
                     await asyncio.sleep(POLL_INTERVAL)
                     waited += POLL_INTERVAL
                     continue
-                body = await r.json()
+                try:
+                    body = json.loads(body_text)
+                except Exception:
+                    log.error("poll %s bad JSON: %s", task_id, body_text[:300])
+                    await asyncio.sleep(POLL_INTERVAL)
+                    waited += POLL_INTERVAL
+                    continue
                 status = body.get("status")
                 progress = body.get("progress", "?")
-                log.info("poll %s → %s (%s%%)", task_id[:18], status, progress)
+                if first:
+                    log.info("poll %s FIRST: %s", task_id, body_text[:500])
+                    first = False
+                else:
+                    log.info("poll %s → %s (%s%%)", task_id, status, progress)
                 if status == "completed":
                     results = body.get("results") or []
                     if results:
@@ -424,8 +464,11 @@ async def poll_job(session: aiohttp.ClientSession, task_id: str) -> str:
                 if status == "failed":
                     err = (body.get("error") or {}).get("message", "unknown error")
                     raise RuntimeError(f"Generation failed: {err}")
+                if status not in ("pending", "processing"):
+                    log.warning("poll %s unexpected status '%s': %s",
+                                task_id, status, body_text[:500])
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            log.warning("poll %s network error: %s", task_id[:18], e)
+            log.warning("poll %s network: %s", task_id, e)
         await asyncio.sleep(POLL_INTERVAL)
         waited += POLL_INTERVAL
     raise TimeoutError(f"Timed out after {POLL_TIMEOUT}s. Task id: {task_id}")
@@ -598,6 +641,7 @@ async def submit_image_job(session: aiohttp.ClientSession, prompt: str,
     headers = {"Authorization": f"Bearer {EVOLINK_KEY}"}
     async with session.post(IMAGE_GEN_URL, json=payload, headers=headers) as r:
         body = await r.json()
+        log.info("submit_image_job %d: %s", r.status, json.dumps(body)[:500])
         if r.status == 401:
             raise RuntimeError("EvoLink rejected the key (401).")
         if r.status == 402:
@@ -632,7 +676,7 @@ async def run_image_edit(bot, chat_id, *, prompt, image_bytes_list,
             task_id = await submit_image_job(session, prompt, image_urls,
                                               img_size=img_size,
                                               img_quality=img_quality)
-            await status.edit_text(f"Working… (task {task_id[:18]})")
+            await status.edit_text(f"⏳ {task_id}")
             result_url = await poll_job(session, task_id)
 
             # Cache params for repeat
@@ -1024,12 +1068,20 @@ def settings_overview_text() -> str:
 
 
 async def show_settings(update, context):
-    await say(update, context, settings_overview_text(), SETTINGS_KEYBOARD)
+    if authorised(update):
+        await say(update, context, settings_overview_text(), SETTINGS_KEYBOARD)
+    else:
+        text = (
+            "⚙️ Image Settings\n"
+            f"🖼️ Img Res  :  {get_image_quality()}\n"
+            f"📐 Img Size :  {get_image_size()}"
+        )
+        await say(update, context, text, IMAGE_SETTINGS_KEYBOARD)
     return SET_IMAGE_WAIT
 
 
 async def settings_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not authorised(update):
+    if not image_authorised(update):
         return ConversationHandler.END
     context.user_data.clear()
     await clear_close(update, context)
@@ -1039,7 +1091,7 @@ async def settings_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def settings_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles the Settings menu: either a button tap or an incoming photo."""
-    if not authorised(update):
+    if not image_authorised(update):
         return ConversationHandler.END
     track(context, update.message.message_id)
 
@@ -1288,6 +1340,50 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"💳 {bal:.2f} credits remaining.")
 
 
+async def grant_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: /grant <user_id> — give image-only access."""
+    if not authorised(update):
+        return
+    if not context.args:
+        await update.message.reply_text("/grant <user_id>")
+        return
+    try:
+        uid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Not a valid user ID.")
+        return
+    _grant_image_user(uid)
+    await update.message.reply_text(f"✅ {uid} granted image access.")
+
+
+async def revoke_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: /revoke <user_id> — remove image-only access."""
+    if not authorised(update):
+        return
+    if not context.args:
+        await update.message.reply_text("/revoke <user_id>")
+        return
+    try:
+        uid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Not a valid user ID.")
+        return
+    _revoke_image_user(uid)
+    await update.message.reply_text(f"❌ {uid} revoked.")
+
+
+async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: /users — list image-only users."""
+    if not authorised(update):
+        return
+    img_users = _get_image_users()
+    if not img_users:
+        await update.message.reply_text("No image users.")
+        return
+    lines = [str(uid) for uid in sorted(img_users)]
+    await update.message.reply_text("Image users:\n" + "\n".join(lines))
+
+
 async def repeat_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle 🔁/👁️/✏️/🖌️ inline button presses."""
     query = update.callback_query
@@ -1397,7 +1493,14 @@ async def img_action_catch(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .read_timeout(60)
+        .write_timeout(60)
+        .connect_timeout(30)
+        .build()
+    )
 
     cancel_filter = filters.Regex(f"^{BTN_CANCEL}$")
     txt = filters.TEXT & ~filters.COMMAND & ~cancel_filter
@@ -1437,6 +1540,9 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("balance", balance))
+    app.add_handler(CommandHandler("grant", grant_cmd))
+    app.add_handler(CommandHandler("revoke", revoke_cmd))
+    app.add_handler(CommandHandler("users", users_cmd))
     app.add_handler(CallbackQueryHandler(repeat_callback, pattern=r"^(rep|shp|edp|edr):"))
     app.add_handler(conv)
     # Catch text/photos after inline button taps (runs only when no conv is active)
