@@ -588,28 +588,49 @@ async def run_generation(bot, chat_id, *, prompt, caption, image_url=None,
                     await bot.send_message(chat_id, f"Clip{tag} failed: {e}")
                     continue
 
+                # Cache for repeat/edit
+                rid = uuid.uuid4().hex[:12]
+                _repeat_cache[rid] = {
+                    "type": "video",
+                    "prompt": prompt,
+                    "caption": caption,
+                    "image_url": image_url,
+                    "image_bytes": image_bytes,
+                    "duration": duration,
+                    "quality": quality,
+                    "aspect_ratio": aspect_ratio,
+                    "count": 1,
+                    "chat_id": chat_id,
+                }
+                btns = [
+                    InlineKeyboardButton("🔁", callback_data=f"vrep:{rid}"),
+                    InlineKeyboardButton("👁️", callback_data=f"vshp:{rid}"),
+                    InlineKeyboardButton("💬", callback_data=f"vdlg:{rid}"),
+                    InlineKeyboardButton("📝", callback_data=f"vprm:{rid}"),
+                ]
+                vid_kb = InlineKeyboardMarkup([btns])
+
                 base = f"{caption}{tag}" if caption else tag.strip()
                 if data is None:
                     await bot.send_message(chat_id,
                         f"Video{tag} is {size/1_048_576:.1f} MB — too big for Telegram.\n"
-                        f"Link (expires 24h, save now):\n{video_url}"
-                    )
+                        f"Link (expires 24h, save now):\n{video_url}",
+                        reply_markup=vid_kb)
                 else:
                     await bot.send_video(chat_id, video=data,
                                          caption=(base or None),
-                                         supports_streaming=True)
+                                         supports_streaming=True,
+                                         reply_markup=vid_kb)
                 any_sent = True
 
             credits_after = await get_credits(session)
             if credits_after is not None and credits_before is not None:
                 used = max(credits_before - credits_after, 0)
-                summary = f"💳 Used {used:.2f} credits · {credits_after:.2f} left"
+                await bot.send_message(chat_id,
+                    f"💳 {used:.2f} · {credits_after:.2f} left")
             elif credits_after is not None:
-                summary = f"💳 {credits_after:.2f} credits left"
-            else:
-                summary = ""
-            if summary:
-                await bot.send_message(chat_id, summary)
+                await bot.send_message(chat_id,
+                    f"💳 {credits_after:.2f} left")
             return any_sent
     except Exception as e:  # noqa: BLE001
         log.exception("generation failed")
@@ -1385,7 +1406,7 @@ async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def repeat_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle 🔁/👁️/✏️/🖌️ inline button presses."""
+    """Handle inline button presses for image and video results."""
     query = update.callback_query
     await query.answer()
     if not query.data:
@@ -1398,6 +1419,7 @@ async def repeat_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("expired", show_alert=True)
         return
 
+    # ---- IMAGE actions ----
     if action == "rep":
         asyncio.create_task(run_image_edit(
             context.bot, params["chat_id"],
@@ -1413,6 +1435,7 @@ async def repeat_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif action == "edp":
         context.user_data["editing_rid"] = rid
+        context.user_data["editing_type"] = "image"
         context.user_data.pop("editing_result", None)
         await context.bot.send_message(params["chat_id"], "✏️")
 
@@ -1431,28 +1454,77 @@ async def repeat_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(
             params["chat_id"], "➕📷 or ✏️")
 
+    # ---- VIDEO actions ----
+    elif action == "vrep":
+        asyncio.create_task(run_generation(
+            context.bot, params["chat_id"],
+            prompt=params["prompt"], caption=params["caption"],
+            image_url=params.get("image_url"),
+            image_bytes=params.get("image_bytes"),
+            duration=params["duration"], quality=params["quality"],
+            aspect_ratio=params["aspect_ratio"], count=1,
+        ))
+
+    elif action == "vshp":
+        await context.bot.send_message(
+            params["chat_id"], f"📝 {params['prompt']}")
+
+    elif action == "vdlg":
+        context.user_data["editing_rid"] = rid
+        context.user_data["editing_type"] = "video_dlg"
+        context.user_data.pop("editing_result", None)
+        await context.bot.send_message(params["chat_id"], "💬")
+
+    elif action == "vprm":
+        context.user_data["editing_rid"] = rid
+        context.user_data["editing_type"] = "video_prm"
+        context.user_data.pop("editing_result", None)
+        await context.bot.send_message(params["chat_id"], "📝")
+
 
 async def img_action_catch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Catch text/photos after inline button taps (✏️ edit prompt, 🖌️ edit result)."""
+    """Catch text/photos after inline button taps (image edit, video edit)."""
 
-    # --- ✏️ edit prompt: just swap prompt, same images ---
+    # --- ✏️/💬/📝 edit prompt/dialogue ---
     rid = context.user_data.get("editing_rid")
     if rid:
         text = (update.message.text or "").strip()
         if not text:
             return
         context.user_data.pop("editing_rid", None)
+        edit_type = context.user_data.pop("editing_type", "image")
         params = _repeat_cache.get(rid)
         if not params:
             await update.message.reply_text("expired")
             return
-        asyncio.create_task(run_image_edit(
-            context.bot, update.effective_chat.id,
-            prompt=text,
-            image_bytes_list=params["image_bytes_list"],
-            img_size=params["img_size"],
-            img_quality=params["img_quality"],
-        ))
+
+        if edit_type == "image":
+            asyncio.create_task(run_image_edit(
+                context.bot, update.effective_chat.id,
+                prompt=text,
+                image_bytes_list=params["image_bytes_list"],
+                img_size=params["img_size"],
+                img_quality=params["img_quality"],
+            ))
+        elif edit_type == "video_dlg":
+            new_prompt = load_template().format(dialogue=text)
+            asyncio.create_task(run_generation(
+                context.bot, update.effective_chat.id,
+                prompt=new_prompt, caption=text,
+                image_url=params.get("image_url"),
+                image_bytes=params.get("image_bytes"),
+                duration=params["duration"], quality=params["quality"],
+                aspect_ratio=params["aspect_ratio"], count=1,
+            ))
+        elif edit_type == "video_prm":
+            asyncio.create_task(run_generation(
+                context.bot, update.effective_chat.id,
+                prompt=text, caption="",
+                image_url=params.get("image_url"),
+                image_bytes=params.get("image_bytes"),
+                duration=params["duration"], quality=params["quality"],
+                aspect_ratio=params["aspect_ratio"], count=1,
+            ))
         return
 
     # --- 🖌️ edit result: result as base, optional refs, then prompt ---
@@ -1460,7 +1532,6 @@ async def img_action_catch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not er:
         return
 
-    # Photo → add as ref
     file_id = None
     if update.message.photo:
         file_id = update.message.photo[-1].file_id
@@ -1477,7 +1548,6 @@ async def img_action_catch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ +{refs} — ➕📷 or ✏️")
         return
 
-    # Text → prompt, fire gen with result as base + refs
     text = (update.message.text or "").strip()
     if not text:
         return
@@ -1543,7 +1613,7 @@ def main():
     app.add_handler(CommandHandler("grant", grant_cmd))
     app.add_handler(CommandHandler("revoke", revoke_cmd))
     app.add_handler(CommandHandler("users", users_cmd))
-    app.add_handler(CallbackQueryHandler(repeat_callback, pattern=r"^(rep|shp|edp|edr):"))
+    app.add_handler(CallbackQueryHandler(repeat_callback, pattern=r"^(rep|shp|edp|edr|vrep|vshp|vdlg|vprm):"))
     app.add_handler(conv)
     # Catch text/photos after inline button taps (runs only when no conv is active)
     app.add_handler(MessageHandler(
