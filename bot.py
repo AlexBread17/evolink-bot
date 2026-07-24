@@ -120,7 +120,7 @@ _repeat_cache: dict[str, dict] = {}
 
 # Polling
 POLL_INTERVAL = 5
-POLL_TIMEOUT = 600        # 10 min
+POLL_TIMEOUT = 900        # 15 min
 
 # Telegram bot-upload ceiling
 TG_UPLOAD_LIMIT = 50 * 1024 * 1024
@@ -402,19 +402,30 @@ async def submit_job(session: aiohttp.ClientSession, prompt: str,
 async def poll_job(session: aiohttp.ClientSession, task_id: str) -> str:
     headers = {"Authorization": f"Bearer {EVOLINK_KEY}"}
     url = TASK_URL.format(task_id=task_id)
+    req_timeout = aiohttp.ClientTimeout(total=30)
     waited = 0
     while waited < POLL_TIMEOUT:
-        async with session.get(url, headers=headers) as r:
-            body = await r.json()
-            status = body.get("status")
-            if status == "completed":
-                results = body.get("results") or []
-                if results:
-                    return results[0]
-                raise RuntimeError(f"Completed but no results: {body}")
-            if status == "failed":
-                err = (body.get("error") or {}).get("message", "unknown error")
-                raise RuntimeError(f"Generation failed: {err}")
+        try:
+            async with session.get(url, headers=headers, timeout=req_timeout) as r:
+                if r.status != 200:
+                    log.warning("poll %s → HTTP %d", task_id[:18], r.status)
+                    await asyncio.sleep(POLL_INTERVAL)
+                    waited += POLL_INTERVAL
+                    continue
+                body = await r.json()
+                status = body.get("status")
+                progress = body.get("progress", "?")
+                log.info("poll %s → %s (%s%%)", task_id[:18], status, progress)
+                if status == "completed":
+                    results = body.get("results") or []
+                    if results:
+                        return results[0]
+                    raise RuntimeError(f"Completed but no results: {body}")
+                if status == "failed":
+                    err = (body.get("error") or {}).get("message", "unknown error")
+                    raise RuntimeError(f"Generation failed: {err}")
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            log.warning("poll %s network error: %s", task_id[:18], e)
         await asyncio.sleep(POLL_INTERVAL)
         waited += POLL_INTERVAL
     raise TimeoutError(f"Timed out after {POLL_TIMEOUT}s. Task id: {task_id}")
@@ -511,7 +522,7 @@ async def run_generation(bot, chat_id, *, prompt, caption, image_url=None,
     status = await bot.send_message(chat_id,
         "Uploading…" if count == 1 else f"Uploading… (making {count} clips)"
     )
-    timeout = aiohttp.ClientTimeout(total=POLL_TIMEOUT + 120)
+    timeout = aiohttp.ClientTimeout(total=None)  # no session-level cap; poll_job has its own
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             credits_before = await get_credits(session)
@@ -607,7 +618,7 @@ async def run_image_edit(bot, chat_id, *, prompt, image_bytes_list,
     count = len(image_bytes_list)
     status = await bot.send_message(chat_id,
         f"Uploading {count} image{'s' if count > 1 else ''}…")
-    timeout = aiohttp.ClientTimeout(total=POLL_TIMEOUT + 120)
+    timeout = aiohttp.ClientTimeout(total=None)  # no session-level cap; poll_job has its own
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             credits_before = await get_credits(session)
@@ -633,9 +644,11 @@ async def run_image_edit(bot, chat_id, *, prompt, image_bytes_list,
                 "img_quality": img_quality,
                 "chat_id": chat_id,
             }
-            repeat_kb = InlineKeyboardMarkup(
-                [[InlineKeyboardButton("🔁", callback_data=f"rep:{rid}")]]
-            )
+            repeat_kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔁", callback_data=f"rep:{rid}"),
+                InlineKeyboardButton("👁️", callback_data=f"shp:{rid}"),
+                InlineKeyboardButton("✏️", callback_data=f"edp:{rid}"),
+            ]])
 
             data, size = await fetch_bytes(session, result_url)
             if data is None:
@@ -1290,20 +1303,54 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def repeat_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle 🔁 inline button press — re-run the same image edit."""
+    """Handle 🔁/👁️/✏️ inline button presses."""
     query = update.callback_query
     await query.answer()
-    if not query.data or not query.data.startswith("rep:"):
+    if not query.data:
         return
-    rid = query.data[4:]
+    action, _, rid = query.data.partition(":")
+    if not rid:
+        return
     params = _repeat_cache.get(rid)
     if not params:
-        await query.edit_message_text("🔁 expired")
+        await query.answer("expired", show_alert=True)
         return
-    chat_id = params["chat_id"]
+
+    if action == "rep":
+        asyncio.create_task(run_image_edit(
+            context.bot, params["chat_id"],
+            prompt=params["prompt"],
+            image_bytes_list=params["image_bytes_list"],
+            img_size=params["img_size"],
+            img_quality=params["img_quality"],
+        ))
+
+    elif action == "shp":
+        await context.bot.send_message(
+            params["chat_id"], f"📝 {params['prompt']}")
+
+    elif action == "edp":
+        context.user_data["editing_rid"] = rid
+        await context.bot.send_message(
+            params["chat_id"], "✏️")
+
+
+async def edit_prompt_catch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Catch text after ✏️ was tapped — re-run with new prompt."""
+    rid = context.user_data.pop("editing_rid", None)
+    if not rid:
+        return
+    params = _repeat_cache.get(rid)
+    if not params:
+        await update.message.reply_text("expired")
+        return
+    new_prompt = (update.message.text or "").strip()
+    if not new_prompt:
+        context.user_data["editing_rid"] = rid  # put it back
+        return
     asyncio.create_task(run_image_edit(
-        context.bot, chat_id,
-        prompt=params["prompt"],
+        context.bot, update.effective_chat.id,
+        prompt=new_prompt,
         image_bytes_list=params["image_bytes_list"],
         img_size=params["img_size"],
         img_quality=params["img_quality"],
@@ -1352,8 +1399,12 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("balance", balance))
-    app.add_handler(CallbackQueryHandler(repeat_callback, pattern=r"^rep:"))
+    app.add_handler(CallbackQueryHandler(repeat_callback, pattern=r"^(rep|shp|edp):"))
     app.add_handler(conv)
+    # Catch text after ✏️ edit prompt button (runs only when no conv is active)
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND, edit_prompt_catch
+    ))
     log.info("Bot starting (long-polling)…")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
