@@ -32,14 +32,16 @@ import os
 import json
 import asyncio
 import logging
+import uuid
 import aiohttp
 
-from telegram import Update, ReplyKeyboardMarkup
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     ConversationHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -112,6 +114,9 @@ CREDITS_URL = "https://api.evolink.ai/v1/credits"
 
 # Where the Quick Mode default image URL is persisted.
 STATE_FILE = os.environ.get("STATE_FILE", "/tmp/evolink_bot_state.json")
+
+# In-memory cache for image repeat jobs (key -> params dict).
+_repeat_cache: dict[str, dict] = {}
 
 # Polling
 POLL_INTERVAL = 5
@@ -619,25 +624,37 @@ async def run_image_edit(bot, chat_id, *, prompt, image_bytes_list,
             await status.edit_text(f"Working… (task {task_id[:18]})")
             result_url = await poll_job(session, task_id)
 
+            # Cache params for repeat
+            rid = uuid.uuid4().hex[:12]
+            _repeat_cache[rid] = {
+                "prompt": prompt,
+                "image_bytes_list": image_bytes_list,
+                "img_size": img_size,
+                "img_quality": img_quality,
+                "chat_id": chat_id,
+            }
+            repeat_kb = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔁", callback_data=f"rep:{rid}")]]
+            )
+
             data, size = await fetch_bytes(session, result_url)
             if data is None:
                 await bot.send_message(chat_id,
                     f"Image is {size/1_048_576:.1f} MB — too big for Telegram.\n"
-                    f"Link (expires 24h):\n{result_url}"
-                )
+                    f"Link (expires 24h):\n{result_url}",
+                    reply_markup=repeat_kb)
             else:
-                await bot.send_photo(chat_id, photo=data)
+                await bot.send_photo(chat_id, photo=data,
+                                     reply_markup=repeat_kb)
 
             credits_after = await get_credits(session)
             if credits_after is not None and credits_before is not None:
                 used = max(credits_before - credits_after, 0)
-                summary = f"💳 Used {used:.2f} credits · {credits_after:.2f} left"
+                await bot.send_message(chat_id,
+                    f"💳 {used:.2f} · {credits_after:.2f} left")
             elif credits_after is not None:
-                summary = f"💳 {credits_after:.2f} credits left"
-            else:
-                summary = ""
-            if summary:
-                await bot.send_message(chat_id, summary)
+                await bot.send_message(chat_id,
+                    f"💳 {credits_after:.2f} left")
             return True
     except Exception as e:
         log.exception("image edit failed")
@@ -1272,6 +1289,27 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"💳 {bal:.2f} credits remaining.")
 
 
+async def repeat_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle 🔁 inline button press — re-run the same image edit."""
+    query = update.callback_query
+    await query.answer()
+    if not query.data or not query.data.startswith("rep:"):
+        return
+    rid = query.data[4:]
+    params = _repeat_cache.get(rid)
+    if not params:
+        await query.edit_message_text("🔁 expired")
+        return
+    chat_id = params["chat_id"]
+    asyncio.create_task(run_image_edit(
+        context.bot, chat_id,
+        prompt=params["prompt"],
+        image_bytes_list=params["image_bytes_list"],
+        img_size=params["img_size"],
+        img_quality=params["img_quality"],
+    ))
+
+
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -1314,6 +1352,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("balance", balance))
+    app.add_handler(CallbackQueryHandler(repeat_callback, pattern=r"^rep:"))
     app.add_handler(conv)
     log.info("Bot starting (long-polling)…")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
