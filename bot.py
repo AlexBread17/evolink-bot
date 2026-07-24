@@ -643,11 +643,13 @@ async def run_image_edit(bot, chat_id, *, prompt, image_bytes_list,
                 "img_size": img_size,
                 "img_quality": img_quality,
                 "chat_id": chat_id,
+                "result_bytes": None,  # filled below if download succeeds
             }
             repeat_kb = InlineKeyboardMarkup([[
                 InlineKeyboardButton("🔁", callback_data=f"rep:{rid}"),
                 InlineKeyboardButton("👁️", callback_data=f"shp:{rid}"),
                 InlineKeyboardButton("✏️", callback_data=f"edp:{rid}"),
+                InlineKeyboardButton("🖌️", callback_data=f"edr:{rid}"),
             ]])
 
             data, size = await fetch_bytes(session, result_url)
@@ -657,6 +659,7 @@ async def run_image_edit(bot, chat_id, *, prompt, image_bytes_list,
                     f"Link (expires 24h):\n{result_url}",
                     reply_markup=repeat_kb)
             else:
+                _repeat_cache[rid]["result_bytes"] = data
                 await bot.send_photo(chat_id, photo=data,
                                      reply_markup=repeat_kb)
 
@@ -689,7 +692,7 @@ async def img_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await clear_close(update, context)
     track(context, update.message.message_id)
-    await say(update, context, "Send the photo.", CANCEL_KEYBOARD)
+    await say(update, context, "📷", CANCEL_KEYBOARD)
     return IMG_EDIT_PHOTO
 
 
@@ -703,15 +706,16 @@ async def img_edit_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif update.message.document and (update.message.document.mime_type or "").startswith("image/"):
         file_id = update.message.document.file_id
     if not file_id:
-        await say(update, context, "Send a photo.", CANCEL_KEYBOARD)
+        await say(update, context, "📷", CANCEL_KEYBOARD)
         return IMG_EDIT_PHOTO
     tg_file = await context.bot.get_file(file_id)
     context.user_data["image_list"] = [bytes(await tg_file.download_as_bytearray())]
-    await say(update, context, "➕📷 or ▶️", REFS_KEYBOARD)
+    await say(update, context, "➕📷 or ✏️", BACK_CANCEL_KEYBOARD)
     return IMG_EDIT_REFS
 
 
 async def img_edit_refs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Photo → add ref. Text → use as prompt and go to confirm."""
     if not image_authorised(update):
         return ConversationHandler.END
     track(context, update.message.message_id)
@@ -721,50 +725,32 @@ async def img_edit_refs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await say(update, context, "📷", CANCEL_KEYBOARD)
         return IMG_EDIT_PHOTO
 
-    if update.message.text == BTN_NEXT:
-        await say(update, context, "✏️", BACK_CANCEL_KEYBOARD)
-        return IMG_EDIT_TEXT
-
+    # Photo → add as ref
     file_id = None
     if update.message.photo:
         file_id = update.message.photo[-1].file_id
     elif update.message.document and (update.message.document.mime_type or "").startswith("image/"):
         file_id = update.message.document.file_id
 
-    if not file_id:
-        await say(update, context, "📷 or ▶️", REFS_KEYBOARD)
-        return IMG_EDIT_REFS
-
-    img_list = context.user_data.get("image_list", [])
-    if len(img_list) >= MAX_EDIT_IMAGES:
-        await say(update, context, "🚫 max — ▶️", REFS_KEYBOARD)
-        return IMG_EDIT_REFS
-
-    tg_file = await context.bot.get_file(file_id)
-    img_list.append(bytes(await tg_file.download_as_bytearray()))
-    context.user_data["image_list"] = img_list
-    refs = len(img_list) - 1
-    slots = MAX_EDIT_IMAGES - len(img_list)
-    if slots > 0:
-        await say(update, context, f"✅ +{refs} — ➕📷 or ▶️", REFS_KEYBOARD)
-        return IMG_EDIT_REFS
-    else:
-        await say(update, context, f"✅ +{refs} max — ✏️",
+    if file_id:
+        img_list = context.user_data.get("image_list", [])
+        if len(img_list) >= MAX_EDIT_IMAGES:
+            await say(update, context, f"🚫 max {MAX_EDIT_IMAGES} — ✏️",
+                      BACK_CANCEL_KEYBOARD)
+            return IMG_EDIT_REFS
+        tg_file = await context.bot.get_file(file_id)
+        img_list.append(bytes(await tg_file.download_as_bytearray()))
+        context.user_data["image_list"] = img_list
+        refs = len(img_list) - 1
+        await say(update, context, f"✅ +{refs} — ➕📷 or ✏️",
                   BACK_CANCEL_KEYBOARD)
-        return IMG_EDIT_TEXT
-
-
-async def img_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not image_authorised(update):
-        return ConversationHandler.END
-    track(context, update.message.message_id)
-    if update.message.text == BTN_BACK:
-        await say(update, context, "➕📷 or ▶️", REFS_KEYBOARD)
         return IMG_EDIT_REFS
+
+    # Text → use as prompt, straight to confirm
     text = (update.message.text or "").strip()
     if not text:
-        await say(update, context, "Type the edit.", BACK_CANCEL_KEYBOARD)
-        return IMG_EDIT_TEXT
+        await say(update, context, "➕📷 or ✏️", BACK_CANCEL_KEYBOARD)
+        return IMG_EDIT_REFS
     context.user_data["edit_prompt"] = text
     n = len(context.user_data.get("image_list", []))
     refs_note = f" +{n-1} ref" if n > 1 else ""
@@ -778,8 +764,8 @@ async def img_edit_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     track(context, update.message.message_id)
     if update.message.text == BTN_BACK:
-        await say(update, context, "Edit prompt?", BACK_CANCEL_KEYBOARD)
-        return IMG_EDIT_TEXT
+        await say(update, context, "➕📷 or ✏️", BACK_CANCEL_KEYBOARD)
+        return IMG_EDIT_REFS
     if update.message.text != BTN_GENERATE:
         await say(update, context, "Go, Back, or Cancel.", CONFIRM_KEYBOARD)
         return IMG_EDIT_CONFIRM
@@ -1303,7 +1289,7 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def repeat_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle 🔁/👁️/✏️ inline button presses."""
+    """Handle 🔁/👁️/✏️/🖌️ inline button presses."""
     query = update.callback_query
     await query.answer()
     if not query.data:
@@ -1331,29 +1317,82 @@ async def repeat_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif action == "edp":
         context.user_data["editing_rid"] = rid
+        context.user_data.pop("editing_result", None)
+        await context.bot.send_message(params["chat_id"], "✏️")
+
+    elif action == "edr":
+        result_bytes = params.get("result_bytes")
+        if not result_bytes:
+            await query.answer("no result data", show_alert=True)
+            return
+        context.user_data["editing_result"] = {
+            "base_bytes": result_bytes,
+            "refs": [],
+            "img_size": params["img_size"],
+            "img_quality": params["img_quality"],
+        }
+        context.user_data.pop("editing_rid", None)
         await context.bot.send_message(
-            params["chat_id"], "✏️")
+            params["chat_id"], "➕📷 or ✏️")
 
 
-async def edit_prompt_catch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Catch text after ✏️ was tapped — re-run with new prompt."""
-    rid = context.user_data.pop("editing_rid", None)
-    if not rid:
+async def img_action_catch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Catch text/photos after inline button taps (✏️ edit prompt, 🖌️ edit result)."""
+
+    # --- ✏️ edit prompt: just swap prompt, same images ---
+    rid = context.user_data.get("editing_rid")
+    if rid:
+        text = (update.message.text or "").strip()
+        if not text:
+            return
+        context.user_data.pop("editing_rid", None)
+        params = _repeat_cache.get(rid)
+        if not params:
+            await update.message.reply_text("expired")
+            return
+        asyncio.create_task(run_image_edit(
+            context.bot, update.effective_chat.id,
+            prompt=text,
+            image_bytes_list=params["image_bytes_list"],
+            img_size=params["img_size"],
+            img_quality=params["img_quality"],
+        ))
         return
-    params = _repeat_cache.get(rid)
-    if not params:
-        await update.message.reply_text("expired")
+
+    # --- 🖌️ edit result: result as base, optional refs, then prompt ---
+    er = context.user_data.get("editing_result")
+    if not er:
         return
-    new_prompt = (update.message.text or "").strip()
-    if not new_prompt:
-        context.user_data["editing_rid"] = rid  # put it back
+
+    # Photo → add as ref
+    file_id = None
+    if update.message.photo:
+        file_id = update.message.photo[-1].file_id
+    elif update.message.document and (update.message.document.mime_type or "").startswith("image/"):
+        file_id = update.message.document.file_id
+
+    if file_id:
+        if len(er["refs"]) >= MAX_EDIT_IMAGES - 1:
+            await update.message.reply_text(f"🚫 max {MAX_EDIT_IMAGES - 1} refs — ✏️")
+            return
+        tg_file = await context.bot.get_file(file_id)
+        er["refs"].append(bytes(await tg_file.download_as_bytearray()))
+        refs = len(er["refs"])
+        await update.message.reply_text(f"✅ +{refs} — ➕📷 or ✏️")
         return
+
+    # Text → prompt, fire gen with result as base + refs
+    text = (update.message.text or "").strip()
+    if not text:
+        return
+    context.user_data.pop("editing_result", None)
+    image_list = [er["base_bytes"]] + er["refs"]
     asyncio.create_task(run_image_edit(
         context.bot, update.effective_chat.id,
-        prompt=new_prompt,
-        image_bytes_list=params["image_bytes_list"],
-        img_size=params["img_size"],
-        img_quality=params["img_quality"],
+        prompt=text,
+        image_bytes_list=image_list,
+        img_size=er["img_size"],
+        img_quality=er["img_quality"],
     ))
 
 
@@ -1388,7 +1427,6 @@ def main():
             PICK_IMG_SIZE: [MessageHandler(txt, pick_img_size)],
             IMG_EDIT_PHOTO: [MessageHandler(img | txt, img_edit_photo)],
             IMG_EDIT_REFS: [MessageHandler(img | txt, img_edit_refs)],
-            IMG_EDIT_TEXT:  [MessageHandler(txt, img_edit_text)],
             IMG_EDIT_CONFIRM: [MessageHandler(txt, img_edit_confirm)],
         },
         fallbacks=[
@@ -1399,11 +1437,12 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("balance", balance))
-    app.add_handler(CallbackQueryHandler(repeat_callback, pattern=r"^(rep|shp|edp):"))
+    app.add_handler(CallbackQueryHandler(repeat_callback, pattern=r"^(rep|shp|edp|edr):"))
     app.add_handler(conv)
-    # Catch text after ✏️ edit prompt button (runs only when no conv is active)
+    # Catch text/photos after inline button taps (runs only when no conv is active)
     app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND, edit_prompt_catch
+        (filters.TEXT | filters.PHOTO | filters.Document.IMAGE) & ~filters.COMMAND,
+        img_action_catch
     ))
     log.info("Bot starting (long-polling)…")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
