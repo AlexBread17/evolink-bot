@@ -142,6 +142,7 @@ BTN_SET_ASPECT = "📐 Aspect"
 BTN_SET_COUNT = "🔢 Count"
 BTN_DIALOGUE = "💬 Dialogue"
 BTN_FULLPROMPT = "📝 Prompt"
+BTN_NEXT = "▶️ Next"
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [[BTN_QUICK, BTN_FLEX], [BTN_IMG_EDIT, BTN_SETTINGS]],
@@ -156,6 +157,10 @@ CANCEL_KEYBOARD = ReplyKeyboardMarkup(
 )
 BACK_CANCEL_KEYBOARD = ReplyKeyboardMarkup(
     [[BTN_BACK, BTN_CANCEL]], resize_keyboard=True, one_time_keyboard=False
+)
+REFS_KEYBOARD = ReplyKeyboardMarkup(
+    [[BTN_NEXT], [BTN_BACK, BTN_CANCEL]],
+    resize_keyboard=True, one_time_keyboard=False,
 )
 PROMPTTYPE_KEYBOARD = ReplyKeyboardMarkup(
     [[BTN_DIALOGUE, BTN_FULLPROMPT], [BTN_BACK, BTN_CANCEL]],
@@ -195,7 +200,7 @@ COUNT_KEYBOARD = ReplyKeyboardMarkup(
  FLEX_IMAGE, FLEX_PROMPTTYPE, FLEX_TEXT, FLEX_CONFIRM,
  SET_IMAGE_WAIT, EDIT_PROMPT_WAIT,
  PICK_DURATION, PICK_QUALITY, PICK_ASPECT, PICK_COUNT,
- IMG_EDIT_PHOTO, IMG_EDIT_TEXT, IMG_EDIT_CONFIRM) = range(15)
+ IMG_EDIT_PHOTO, IMG_EDIT_REFS, IMG_EDIT_TEXT, IMG_EDIT_CONFIRM) = range(16)
 
 
 def authorised(update: Update) -> bool:
@@ -527,11 +532,11 @@ async def run_generation(bot, chat_id, *, prompt, caption, image_url=None,
 # Image edit generation core
 # ---------------------------------------------------------------------------
 async def submit_image_job(session: aiohttp.ClientSession, prompt: str,
-                           image_url: str) -> str:
+                           image_urls: list[str]) -> str:
     payload = {
         "model": IMAGE_MODEL,
         "prompt": prompt,
-        "image_urls": [image_url],
+        "image_urls": image_urls,
         "size": DEFAULT_IMAGE_SIZE,
         "quality": DEFAULT_IMAGE_QUALITY,
         "n": 1,
@@ -553,20 +558,25 @@ async def submit_image_job(session: aiohttp.ClientSession, prompt: str,
         return task_id
 
 
-async def run_image_edit(bot, chat_id, *, prompt, image_url=None,
-                         image_bytes=None):
-    """Upload image, submit Seedream edit job, poll, send result photo.
+async def run_image_edit(bot, chat_id, *, prompt, image_bytes_list):
+    """Upload image(s), submit Seedream edit job, poll, send result photo.
+    image_bytes_list[0] = edit target, rest = references.
     Runs as an asyncio background task."""
-    status = await bot.send_message(chat_id, "Uploading…")
+    count = len(image_bytes_list)
+    status = await bot.send_message(chat_id,
+        f"Uploading {count} image{'s' if count > 1 else ''}…")
     timeout = aiohttp.ClientTimeout(total=POLL_TIMEOUT + 120)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             credits_before = await get_credits(session)
-            if image_url is None:
-                image_url = await upload_image(session, image_bytes)
+            image_urls = []
+            for i, img_bytes in enumerate(image_bytes_list):
+                url = await upload_image(session, img_bytes,
+                                         filename=f"img_{i}.jpg")
+                image_urls.append(url)
 
             await status.edit_text("Editing image… 10–45s.")
-            task_id = await submit_image_job(session, prompt, image_url)
+            task_id = await submit_image_job(session, prompt, image_urls)
             await status.edit_text(f"Working… (task {task_id[:18]})")
             result_url = await poll_job(session, task_id)
 
@@ -602,13 +612,15 @@ async def run_image_edit(bot, chat_id, *, prompt, image_url=None,
 
 
 # ---------- IMAGE EDIT MODE ----------
+MAX_EDIT_IMAGES = 5  # 1 target + up to 4 refs
+
 async def img_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not image_authorised(update):
         return ConversationHandler.END
     context.user_data.clear()
     await clear_close(update, context)
     track(context, update.message.message_id)
-    await say(update, context, "Image Edit. Send the photo to edit.",
+    await say(update, context, "Image Edit. Send the photo to edit (1st = target).",
               CANCEL_KEYBOARD)
     return IMG_EDIT_PHOTO
 
@@ -627,11 +639,67 @@ async def img_edit_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                   CANCEL_KEYBOARD)
         return IMG_EDIT_PHOTO
     tg_file = await context.bot.get_file(file_id)
-    context.user_data["image_bytes"] = bytes(await tg_file.download_as_bytearray())
-    await say(update, context, "Describe the edit (e.g. 'remove background', "
-              "'make her hair blonde', 'add sunglasses').",
-              BACK_CANCEL_KEYBOARD)
-    return IMG_EDIT_TEXT
+    context.user_data["image_list"] = [bytes(await tg_file.download_as_bytearray())]
+    await say(update, context,
+              "Got it. Send reference images for inspo/detail, "
+              f"or tap {BTN_NEXT} to skip (up to {MAX_EDIT_IMAGES - 1} refs).",
+              REFS_KEYBOARD)
+    return IMG_EDIT_REFS
+
+
+async def img_edit_refs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not image_authorised(update):
+        return ConversationHandler.END
+    track(context, update.message.message_id)
+
+    if update.message.text == BTN_BACK:
+        context.user_data.pop("image_list", None)
+        await say(update, context, "Send the photo to edit.", CANCEL_KEYBOARD)
+        return IMG_EDIT_PHOTO
+
+    if update.message.text == BTN_NEXT:
+        n = len(context.user_data.get("image_list", []))
+        label = f"1 image" if n == 1 else f"{n} images ({n-1} refs)"
+        await say(update, context,
+                  f"{label}. Describe the edit.",
+                  BACK_CANCEL_KEYBOARD)
+        return IMG_EDIT_TEXT
+
+    # Try to grab an image
+    file_id = None
+    if update.message.photo:
+        file_id = update.message.photo[-1].file_id
+    elif update.message.document and (update.message.document.mime_type or "").startswith("image/"):
+        file_id = update.message.document.file_id
+
+    if not file_id:
+        await say(update, context,
+                  f"Send a photo or tap {BTN_NEXT} to continue.",
+                  REFS_KEYBOARD)
+        return IMG_EDIT_REFS
+
+    img_list = context.user_data.get("image_list", [])
+    if len(img_list) >= MAX_EDIT_IMAGES:
+        await say(update, context,
+                  f"Max {MAX_EDIT_IMAGES} images reached. Tap {BTN_NEXT} to continue.",
+                  REFS_KEYBOARD)
+        return IMG_EDIT_REFS
+
+    tg_file = await context.bot.get_file(file_id)
+    img_list.append(bytes(await tg_file.download_as_bytearray()))
+    context.user_data["image_list"] = img_list
+    refs = len(img_list) - 1
+    slots = MAX_EDIT_IMAGES - len(img_list)
+    if slots > 0:
+        await say(update, context,
+                  f"Ref {refs} added. Send more or tap {BTN_NEXT} ({slots} slots left).",
+                  REFS_KEYBOARD)
+        return IMG_EDIT_REFS
+    else:
+        await say(update, context,
+                  f"Ref {refs} added — max reached. Describe the edit.",
+                  BACK_CANCEL_KEYBOARD)
+        return IMG_EDIT_TEXT
 
 
 async def img_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -639,16 +707,28 @@ async def img_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     track(context, update.message.message_id)
     if update.message.text == BTN_BACK:
-        context.user_data.pop("image_bytes", None)
-        await say(update, context, "Send the photo to edit.", CANCEL_KEYBOARD)
-        return IMG_EDIT_PHOTO
+        n = len(context.user_data.get("image_list", []))
+        if n > 1:
+            # Go back to refs stage, keep what we have
+            await say(update, context,
+                      f"{n-1} ref(s) added. Send more or tap {BTN_NEXT}.",
+                      REFS_KEYBOARD)
+            return IMG_EDIT_REFS
+        else:
+            await say(update, context,
+                      f"Send reference images or tap {BTN_NEXT} to skip.",
+                      REFS_KEYBOARD)
+            return IMG_EDIT_REFS
     text = (update.message.text or "").strip()
     if not text:
         await say(update, context, "Describe the edit as text.",
                   BACK_CANCEL_KEYBOARD)
         return IMG_EDIT_TEXT
     context.user_data["edit_prompt"] = text
-    await say(update, context, f"Edit: \"{text}\"\nGo?", CONFIRM_KEYBOARD)
+    n = len(context.user_data.get("image_list", []))
+    refs_note = f" + {n-1} ref(s)" if n > 1 else ""
+    await say(update, context, f"Edit: \"{text}\"\n1 target{refs_note}\nGo?",
+              CONFIRM_KEYBOARD)
     return IMG_EDIT_CONFIRM
 
 
@@ -667,8 +747,8 @@ async def img_edit_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return IMG_EDIT_CONFIRM
 
     prompt = context.user_data.get("edit_prompt")
-    img_bytes = context.user_data.get("image_bytes")
-    if not prompt or not img_bytes:
+    img_list = context.user_data.get("image_list")
+    if not prompt or not img_list:
         await cleanup(update, context)
         await close_msg(update, context, "Lost the details — start again.")
         return ConversationHandler.END
@@ -676,7 +756,7 @@ async def img_edit_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cleanup(update, context)
     asyncio.create_task(run_image_edit(
         context.bot, update.effective_chat.id,
-        prompt=prompt, image_bytes=img_bytes,
+        prompt=prompt, image_bytes_list=img_list,
     ))
     await close_msg(update, context, "⏳ Queued. You can start another.")
     return ConversationHandler.END
@@ -1166,6 +1246,7 @@ def main():
             PICK_ASPECT: [MessageHandler(txt, pick_aspect)],
             PICK_COUNT: [MessageHandler(txt, pick_count)],
             IMG_EDIT_PHOTO: [MessageHandler(img | txt, img_edit_photo)],
+            IMG_EDIT_REFS: [MessageHandler(img | txt, img_edit_refs)],
             IMG_EDIT_TEXT:  [MessageHandler(txt, img_edit_text)],
             IMG_EDIT_CONFIRM: [MessageHandler(txt, img_edit_confirm)],
         },
