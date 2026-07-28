@@ -652,13 +652,14 @@ async def submit_image_job(session: aiohttp.ClientSession, prompt: str,
     payload = {
         "model": IMAGE_MODEL,
         "prompt": prompt,
-        "image_urls": image_urls,
         "size": img_size,
         "quality": img_quality,
         "n": 1,
         "output_format": "png",
         "watermark": False,
     }
+    if image_urls:
+        payload["image_urls"] = image_urls
     headers = {"Authorization": f"Bearer {EVOLINK_KEY}"}
     async with session.post(IMAGE_GEN_URL, json=payload, headers=headers) as r:
         body = await r.json()
@@ -677,12 +678,12 @@ async def submit_image_job(session: aiohttp.ClientSession, prompt: str,
 
 async def run_image_edit(bot, chat_id, *, prompt, image_bytes_list,
                          img_size, img_quality):
-    """Upload image(s), submit Seedream edit job, poll, send result photo.
-    image_bytes_list[0] = edit target, rest = references.
+    """Upload image(s), submit Seedream job, poll, send result photo.
+    image_bytes_list can be empty for text-to-image.
     Runs as an asyncio background task."""
     count = len(image_bytes_list)
     status = await bot.send_message(chat_id,
-        f"Uploading {count} image{'s' if count > 1 else ''}…")
+        f"Uploading {count} image{'s' if count != 1 else ''}…" if count else "Generating…")
     timeout = aiohttp.ClientTimeout(total=None)  # no session-level cap; poll_job has its own
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -763,7 +764,7 @@ async def img_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def img_edit_refs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Photo → add to list. Text → prompt if we have at least 1 photo."""
+    """Photo → add to list. Text → prompt (with or without photos)."""
     if not image_authorised(update):
         return ConversationHandler.END
     track(context, update.message.message_id)
@@ -810,21 +811,21 @@ async def img_edit_refs(update: Update, context: ContextTypes.DEFAULT_TYPE):
                       BACK_CANCEL_KEYBOARD)
         return IMG_EDIT_REFS
 
-    # Text → prompt
+    # Text → prompt (works with or without photos)
     text = (update.message.text or "").strip()
     if not text:
         return IMG_EDIT_REFS
 
-    img_list = context.user_data.get("image_list", [])
-    if not img_list:
-        await say(update, context, "Need at least 1 📷 first.",
-                  CANCEL_KEYBOARD)
-        return IMG_EDIT_REFS
-
     context.user_data["edit_prompt"] = text
+    img_list = context.user_data.get("image_list", [])
     n = len(img_list)
-    refs_note = f" +{n-1} ref" if n > 1 else ""
-    await say(update, context, f"\"{text}\"{refs_note} — Go?",
+    if n == 0:
+        label = "text-to-image"
+    elif n == 1:
+        label = "1 img"
+    else:
+        label = f"1 img +{n-1} ref"
+    await say(update, context, f"\"{text}\" — {label} — Go?",
               CONFIRM_KEYBOARD)
     return IMG_EDIT_CONFIRM
 
@@ -843,8 +844,8 @@ async def img_edit_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return IMG_EDIT_CONFIRM
 
     prompt = context.user_data.get("edit_prompt")
-    img_list = context.user_data.get("image_list")
-    if not prompt or not img_list:
+    img_list = context.user_data.get("image_list", [])
+    if not prompt:
         await cleanup(update, context)
         await close_msg(update, context, "Lost data — restart.")
         return ConversationHandler.END
