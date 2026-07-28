@@ -757,40 +757,34 @@ async def img_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await clear_close(update, context)
     track(context, update.message.message_id)
-    await say(update, context, "📷", CANCEL_KEYBOARD)
-    return IMG_EDIT_PHOTO
-
-
-async def img_edit_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not image_authorised(update):
-        return ConversationHandler.END
-    track(context, update.message.message_id)
-    file_id = None
-    if update.message.photo:
-        file_id = update.message.photo[-1].file_id
-    elif update.message.document and (update.message.document.mime_type or "").startswith("image/"):
-        file_id = update.message.document.file_id
-    if not file_id:
-        await say(update, context, "📷", CANCEL_KEYBOARD)
-        return IMG_EDIT_PHOTO
-    tg_file = await context.bot.get_file(file_id)
-    context.user_data["image_list"] = [bytes(await tg_file.download_as_bytearray())]
-    await say(update, context, "➕📷 or ✏️", BACK_CANCEL_KEYBOARD)
+    context.user_data["image_list"] = []
+    await say(update, context, "📷 or ✏️", CANCEL_KEYBOARD)
     return IMG_EDIT_REFS
 
 
 async def img_edit_refs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Photo → add ref. Text → use as prompt and go to confirm."""
+    """Photo → add to list. Text → prompt if we have at least 1 photo."""
     if not image_authorised(update):
         return ConversationHandler.END
     track(context, update.message.message_id)
 
     if update.message.text == BTN_BACK:
-        context.user_data.pop("image_list", None)
-        await say(update, context, "📷", CANCEL_KEYBOARD)
-        return IMG_EDIT_PHOTO
+        img_list = context.user_data.get("image_list", [])
+        if img_list:
+            img_list.pop()
+            context.user_data["image_list"] = img_list
+            n = len(img_list)
+            if n == 0:
+                await say(update, context, "📷 or ✏️", CANCEL_KEYBOARD)
+            else:
+                await say(update, context,
+                          f"✅ {n} — ➕📷 or ✏️", BACK_CANCEL_KEYBOARD)
+            return IMG_EDIT_REFS
+        await cleanup(update, context)
+        await close_msg(update, context, "Cancelled.")
+        return ConversationHandler.END
 
-    # Photo → add as ref
+    # Photo → add
     file_id = None
     if update.message.photo:
         file_id = update.message.photo[-1].file_id
@@ -806,18 +800,29 @@ async def img_edit_refs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tg_file = await context.bot.get_file(file_id)
         img_list.append(bytes(await tg_file.download_as_bytearray()))
         context.user_data["image_list"] = img_list
-        refs = len(img_list) - 1
-        await say(update, context, f"✅ +{refs} — ➕📷 or ✏️",
-                  BACK_CANCEL_KEYBOARD)
+        n = len(img_list)
+        if n == 1:
+            await say(update, context, "✅ 1 — ➕📷 or ✏️",
+                      BACK_CANCEL_KEYBOARD)
+        else:
+            await say(update, context,
+                      f"✅ {n} (+{n-1} ref) — ➕📷 or ✏️",
+                      BACK_CANCEL_KEYBOARD)
         return IMG_EDIT_REFS
 
-    # Text → use as prompt, straight to confirm
+    # Text → prompt
     text = (update.message.text or "").strip()
     if not text:
-        await say(update, context, "➕📷 or ✏️", BACK_CANCEL_KEYBOARD)
         return IMG_EDIT_REFS
+
+    img_list = context.user_data.get("image_list", [])
+    if not img_list:
+        await say(update, context, "Need at least 1 📷 first.",
+                  CANCEL_KEYBOARD)
+        return IMG_EDIT_REFS
+
     context.user_data["edit_prompt"] = text
-    n = len(context.user_data.get("image_list", []))
+    n = len(img_list)
     refs_note = f" +{n-1} ref" if n > 1 else ""
     await say(update, context, f"\"{text}\"{refs_note} — Go?",
               CONFIRM_KEYBOARD)
@@ -829,7 +834,9 @@ async def img_edit_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     track(context, update.message.message_id)
     if update.message.text == BTN_BACK:
-        await say(update, context, "➕📷 or ✏️", BACK_CANCEL_KEYBOARD)
+        n = len(context.user_data.get("image_list", []))
+        await say(update, context, f"✅ {n} — ➕📷 or ✏️",
+                  BACK_CANCEL_KEYBOARD)
         return IMG_EDIT_REFS
     if update.message.text != BTN_GENERATE:
         await say(update, context, "Go, Back, or Cancel.", CONFIRM_KEYBOARD)
@@ -1598,7 +1605,6 @@ def main():
             PICK_COUNT: [MessageHandler(txt, pick_count)],
             PICK_IMG_QUALITY: [MessageHandler(txt, pick_img_quality)],
             PICK_IMG_SIZE: [MessageHandler(txt, pick_img_size)],
-            IMG_EDIT_PHOTO: [MessageHandler(img | txt, img_edit_photo)],
             IMG_EDIT_REFS: [MessageHandler(img | txt, img_edit_refs)],
             IMG_EDIT_CONFIRM: [MessageHandler(txt, img_edit_confirm)],
         },
