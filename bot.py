@@ -596,21 +596,24 @@ async def run_throne_edit(bot, chat_id: int, time_str: str, amount: int) -> None
 
             # Prompts for each image
             prompt1 = (
-                f"Edit this Throne gift list screenshot. "
-                f"Find the top row that shows 'Failed' status. "
-                f"Change the number on the left of that row from its current value to {amount}. "
-                f"Change the price on the right of that row from its current value to ${amount}.00. "
-                f"Do NOT change any other rows or any other text. "
-                f"Keep the exact same layout, fonts, colors, and all other content identical."
+                f"Edit this mobile screenshot. Make exactly two changes and nothing else:\n"
+                f"1. In the phone status bar at the very top left of the screen, change the time "
+                f"(e.g. 00:00) to {time_str}.\n"
+                f"2. In the gift list, find the row with the red 'Failed' badge. "
+                f"Change the number on the left of that row to {amount}, "
+                f"and change the dollar amount on the right of that row to ${amount}.00.\n"
+                f"Do NOT change anything else. Keep all other rows, text, colors, "
+                f"layout, and fonts completely identical."
             )
 
             prompt2 = (
-                f"Edit this Throne order detail screenshot. "
-                f"Change the large gift amount number (shown prominently below the image) "
-                f"from its current value to {amount}. "
-                f"Change the price shown (e.g. $40) to ${amount}. "
-                f"Do NOT change any other text, layout, or content. "
-                f"Keep everything else identical."
+                f"Edit this mobile screenshot. Make exactly two changes and nothing else:\n"
+                f"1. In the phone status bar at the very top left of the screen, change the time "
+                f"(e.g. 00:00) to {time_str}.\n"
+                f"2. Change the large bold gift amount number displayed below the gift image "
+                f"to {amount}, and change the price below it (e.g. $40) to ${amount}.\n"
+                f"Do NOT change anything else. Keep all other text, colors, "
+                f"layout, and fonts completely identical."
             )
 
             # Submit both jobs concurrently
@@ -620,7 +623,7 @@ async def run_throne_edit(bot, chat_id: int, time_str: str, amount: int) -> None
                 submit_gpt_image_job(session, prompt2, [url2]),
             )
 
-            await status.edit_text(f"👑 Processing… ⏳")
+            await status.edit_text("👑 Processing… ⏳")
 
             # Poll both concurrently
             result_url1, result_url2 = await asyncio.gather(
@@ -632,16 +635,22 @@ async def run_throne_edit(bot, chat_id: int, time_str: str, amount: int) -> None
             data1, size1 = await fetch_bytes(session, result_url1)
             data2, size2 = await fetch_bytes(session, result_url2)
 
-            # Send results
+            import io
+            # Send results as files (not compressed images)
             caption = f"👑 Throne — {time_str} · ${amount}"
             if data1:
-                await bot.send_photo(chat_id, photo=data1, caption=caption)
+                await bot.send_document(chat_id,
+                    document=io.BytesIO(data1),
+                    filename=f"throne_list_{amount}.png",
+                    caption=caption)
             else:
                 await bot.send_message(chat_id,
                     f"Image 1 too large ({size1/1_048_576:.1f} MB). Link:\n{result_url1}")
 
             if data2:
-                await bot.send_photo(chat_id, photo=data2)
+                await bot.send_document(chat_id,
+                    document=io.BytesIO(data2),
+                    filename=f"throne_detail_{amount}.png")
             else:
                 await bot.send_message(chat_id,
                     f"Image 2 too large ({size2/1_048_576:.1f} MB). Link:\n{result_url2}")
