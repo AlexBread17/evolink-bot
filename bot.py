@@ -29,6 +29,7 @@ re-uploading on every Quick Mode run).
 """
 
 import os
+import re
 import json
 import asyncio
 import logging
@@ -151,13 +152,29 @@ BTN_SET_IMG_SIZE = "📐 Img Size"
 BTN_DIALOGUE = "💬 Dialogue"
 BTN_FULLPROMPT = "📝 Prompt"
 BTN_NEXT = "▶️"
+BTN_THRONE = "👑 Throne"
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
-    [[BTN_QUICK, BTN_FLEX], [BTN_IMG_EDIT, BTN_SETTINGS]],
+    [[BTN_QUICK, BTN_FLEX], [BTN_IMG_EDIT, BTN_THRONE], [BTN_SETTINGS]],
     resize_keyboard=True, one_time_keyboard=False,
 )
+
+# ---------------------------------------------------------------------------
+# Throne feature config
+# ---------------------------------------------------------------------------
+# Paths to the two hardcoded Throne template images.
+# Set via env vars or fall back to files next to the bot.
+THRONE_IMAGE_1_PATH = os.environ.get("THRONE_IMAGE_1", "/app/throne_img1.png")
+THRONE_IMAGE_2_PATH = os.environ.get("THRONE_IMAGE_2", "/app/throne_img2.png")
+
+# The gpt-image-2 model used for Throne editing
+THRONE_MODEL = "gpt-image-2"
+
+# Throne image gen settings (as seen in the UI screenshot: Auto size, Medium quality)
+THRONE_SIZE = "auto"
+THRONE_QUALITY = "medium"
 IMAGE_ONLY_KEYBOARD = ReplyKeyboardMarkup(
-    [[BTN_IMG_EDIT, BTN_SETTINGS]],
+    [[BTN_IMG_EDIT, BTN_THRONE], [BTN_SETTINGS]],
     resize_keyboard=True, one_time_keyboard=False,
 )
 IMAGE_SETTINGS_KEYBOARD = ReplyKeyboardMarkup(
@@ -223,7 +240,8 @@ IMG_SIZE_KEYBOARD = ReplyKeyboardMarkup(
  SET_IMAGE_WAIT, EDIT_PROMPT_WAIT,
  PICK_DURATION, PICK_QUALITY, PICK_ASPECT, PICK_COUNT,
  PICK_IMG_QUALITY, PICK_IMG_SIZE,
- IMG_EDIT_PHOTO, IMG_EDIT_REFS, IMG_EDIT_TEXT, IMG_EDIT_CONFIRM) = range(18)
+ IMG_EDIT_PHOTO, IMG_EDIT_REFS, IMG_EDIT_TEXT, IMG_EDIT_CONFIRM,
+ THRONE_WAIT) = range(19)
 
 
 def authorised(update: Update) -> bool:
@@ -499,6 +517,165 @@ async def get_credits(session: aiohttp.ClientSession):
 
 
 # ---------------------------------------------------------------------------
+# Throne image generation
+# ---------------------------------------------------------------------------
+def _load_throne_image(path: str) -> bytes | None:
+    """Load a Throne template image from disk. Returns None if not found."""
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except FileNotFoundError:
+        log.warning("Throne image not found at: %s", path)
+        return None
+
+
+def _parse_throne_input(text: str) -> tuple[str, int] | None:
+    """Parse 'HH:MM SUM' or 'HH:MM:SS SUM' — returns (time_str, amount) or None."""
+    parts = text.strip().split()
+    if len(parts) < 2:
+        return None
+    # Last token is the amount
+    try:
+        amount = int(parts[-1])
+    except ValueError:
+        return None
+    time_str = " ".join(parts[:-1])
+    if amount <= 0:
+        return None
+    return time_str, amount
+
+
+async def submit_gpt_image_job(session: aiohttp.ClientSession, prompt: str,
+                               image_urls: list[str]) -> str:
+    """Submit a gpt-image-2 image editing job and return the task ID."""
+    payload = {
+        "model": THRONE_MODEL,
+        "prompt": prompt,
+        "size": THRONE_SIZE,
+        "quality": THRONE_QUALITY,
+        "n": 1,
+    }
+    if image_urls:
+        payload["image_urls"] = image_urls
+    headers = {"Authorization": f"Bearer {EVOLINK_KEY}"}
+    async with session.post(IMAGE_GEN_URL, json=payload, headers=headers) as r:
+        body = await r.json()
+        log.info("submit_gpt_image_job %d: %s", r.status, json.dumps(body)[:500])
+        if r.status == 401:
+            raise RuntimeError("EvoLink rejected the key (401).")
+        if r.status == 402:
+            raise RuntimeError("EvoLink balance too low (402). Top up credits.")
+        if r.status >= 400:
+            raise RuntimeError(f"Throne image submit error {r.status}: {body}")
+        task_id = body.get("id")
+        if not task_id:
+            raise RuntimeError(f"No task id returned: {body}")
+        return task_id
+
+
+async def run_throne_edit(bot, chat_id: int, time_str: str, amount: int) -> None:
+    """Edit both Throne template images with the given time and amount.
+
+    Image 1 (gift list): The top row shows a "Failed" gift. Change the number
+      on the left and the dollar amount on the right to match `amount`.
+    Image 2 (order detail): Change the gift amount number and dollar price.
+
+    Both edits are submitted simultaneously to save time.
+    """
+    img1_bytes = _load_throne_image(THRONE_IMAGE_1_PATH)
+    img2_bytes = _load_throne_image(THRONE_IMAGE_2_PATH)
+
+    if not img1_bytes or not img2_bytes:
+        await bot.send_message(
+            chat_id,
+            "⚠️ Throne template images not found on server. "
+            "Please set THRONE_IMAGE_1 and THRONE_IMAGE_2 env vars."
+        )
+        return
+
+    status = await bot.send_message(chat_id, "👑 Uploading Throne images…")
+    timeout = aiohttp.ClientTimeout(total=None)
+
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            credits_before = await get_credits(session)
+
+            # Upload both template images
+            await status.edit_text("👑 Uploading images…")
+            url1 = await upload_image(session, img1_bytes, filename="throne_list.png")
+            url2 = await upload_image(session, img2_bytes, filename="throne_detail.png")
+
+            # Prompts for each image
+            prompt1 = (
+                f"Edit this Throne gift list screenshot. "
+                f"Find the top row that shows 'Failed' status. "
+                f"Change the number on the left of that row from its current value to {amount}. "
+                f"Change the price on the right of that row from its current value to ${amount}.00. "
+                f"Do NOT change any other rows or any other text. "
+                f"Keep the exact same layout, fonts, colors, and all other content identical."
+            )
+
+            prompt2 = (
+                f"Edit this Throne order detail screenshot. "
+                f"Change the large gift amount number (shown prominently below the image) "
+                f"from its current value to {amount}. "
+                f"Change the price shown (e.g. $40) to ${amount}. "
+                f"Do NOT change any other text, layout, or content. "
+                f"Keep everything else identical."
+            )
+
+            # Submit both jobs concurrently
+            await status.edit_text("👑 Submitting edits…")
+            task1, task2 = await asyncio.gather(
+                submit_gpt_image_job(session, prompt1, [url1]),
+                submit_gpt_image_job(session, prompt2, [url2]),
+            )
+
+            await status.edit_text(f"👑 Processing… ⏳")
+
+            # Poll both concurrently
+            result_url1, result_url2 = await asyncio.gather(
+                poll_job(session, task1),
+                poll_job(session, task2),
+            )
+
+            # Fetch both result images
+            data1, size1 = await fetch_bytes(session, result_url1)
+            data2, size2 = await fetch_bytes(session, result_url2)
+
+            # Send results
+            caption = f"👑 Throne — {time_str} · ${amount}"
+            if data1:
+                await bot.send_photo(chat_id, photo=data1, caption=caption)
+            else:
+                await bot.send_message(chat_id,
+                    f"Image 1 too large ({size1/1_048_576:.1f} MB). Link:\n{result_url1}")
+
+            if data2:
+                await bot.send_photo(chat_id, photo=data2)
+            else:
+                await bot.send_message(chat_id,
+                    f"Image 2 too large ({size2/1_048_576:.1f} MB). Link:\n{result_url2}")
+
+            credits_after = await get_credits(session)
+            if credits_after is not None and credits_before is not None:
+                used = max(credits_before - credits_after, 0)
+                await bot.send_message(chat_id,
+                    f"💳 {used:.2f} · {credits_after:.2f} left")
+            elif credits_after is not None:
+                await bot.send_message(chat_id, f"💳 {credits_after:.2f} left")
+
+    except Exception as e:  # noqa: BLE001
+        log.exception("Throne edit failed")
+        await bot.send_message(chat_id, f"👑 Throne failed: {e}")
+    finally:
+        try:
+            await status.delete()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Message cleanup helpers
 # ---------------------------------------------------------------------------
 def track(context: ContextTypes.DEFAULT_TYPE, *message_ids: int) -> None:
@@ -747,6 +924,56 @@ async def run_image_edit(bot, chat_id, *, prompt, image_bytes_list,
             await status.delete()
         except Exception:
             pass
+
+
+# ---------- THRONE MODE ----------
+
+async def throne_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Entry point for the Throne button."""
+    if not image_authorised(update):
+        return ConversationHandler.END
+    context.user_data.clear()
+    await clear_close(update, context)
+    track(context, update.message.message_id)
+    msg = await say(
+        update, context,
+        "👑 *Throne Generator*\n\n"
+        "Send the time and gift amount, e.g.:\n"
+        "`23:45 40`  or  `00:00 60`\n\n"
+        "Both Throne images will be edited and sent back to you.",
+        CANCEL_KEYBOARD,
+    )
+    return THRONE_WAIT
+
+
+async def throne_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle the time + amount input for Throne mode."""
+    if not image_authorised(update):
+        return ConversationHandler.END
+
+    track(context, update.message.message_id)
+    text = (update.message.text or "").strip()
+
+    parsed = _parse_throne_input(text)
+    if parsed is None:
+        await say(
+            update, context,
+            "⚠️ Format: `TIME AMOUNT`  e.g. `23:45 40`\n"
+            "Amount must be a positive integer.",
+            CANCEL_KEYBOARD,
+        )
+        return THRONE_WAIT
+
+    time_str, amount = parsed
+    await cleanup(update, context)
+
+    # Fire and forget
+    asyncio.create_task(
+        run_throne_edit(context.bot, update.effective_chat.id, time_str, amount)
+    )
+
+    await close_msg(update, context, f"👑 Generating Throne for {time_str} · ${amount}…")
+    return ConversationHandler.END
 
 
 # ---------- IMAGE EDIT MODE ----------
@@ -1589,6 +1816,7 @@ def main():
             MessageHandler(filters.Regex(f"^{BTN_QUICK}$"), quick_start),
             MessageHandler(filters.Regex(f"^{BTN_FLEX}$"), flex_start),
             MessageHandler(filters.Regex(r"^🖌️ Edit$"), img_edit_start),
+            MessageHandler(filters.Regex(f"^{re.escape(BTN_THRONE)}$"), throne_start),
             MessageHandler(filters.Regex(f"^{BTN_SETTINGS}$"), settings_start),
         ],
         states={
@@ -1608,6 +1836,7 @@ def main():
             PICK_IMG_SIZE: [MessageHandler(txt, pick_img_size)],
             IMG_EDIT_REFS: [MessageHandler(img | txt, img_edit_refs)],
             IMG_EDIT_CONFIRM: [MessageHandler(txt, img_edit_confirm)],
+            THRONE_WAIT: [MessageHandler(txt, throne_input)],
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
