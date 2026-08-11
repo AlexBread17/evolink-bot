@@ -34,6 +34,7 @@ import json
 import asyncio
 import logging
 import uuid
+import datetime
 import aiohttp
 
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
@@ -89,8 +90,10 @@ ASPECT_LABELS = {
     "1:1": "1:1 square",
     "21:9": "21:9 cinematic",
 }
-# Rough credits-per-second by quality (for cost hints; actuals vary slightly).
-QUALITY_CREDITS_PER_SEC = {"480p": 5.6, "720p": 13.5}
+# Credits-per-second by quality (from EvoLink UI screenshots).
+QUALITY_CREDITS_PER_SEC = {"480p": 4.2, "720p": 10.125}
+# Image edit estimated cost by quality (cr per generation, from EvoLink UI).
+IMAGE_EDIT_CREDITS = {"1K": 2.4, "2K": 4.743}
 
 # Fixed prompt template. {dialogue} is replaced by the line you type.
 PROMPT_TEMPLATE = (
@@ -113,8 +116,10 @@ TASK_URL = "https://api.evolink.ai/v1/tasks/{task_id}"
 UPLOAD_URL = "https://files-api.evolink.ai/api/v1/files/upload/stream"
 CREDITS_URL = "https://api.evolink.ai/v1/credits"
 
-# Where the Quick Mode default image URL is persisted.
+# State persistence: prefer STATE_JSON env var (survives Railway redeploys)
+# Falls back to a local file for development.
 STATE_FILE = os.environ.get("STATE_FILE", "/tmp/evolink_bot_state.json")
+STATE_JSON_ENV = "STATE_JSON"  # name of the Railway env var used for persistence
 
 # In-memory cache for image repeat jobs (key -> params dict).
 _repeat_cache: dict[str, dict] = {}
@@ -153,6 +158,7 @@ BTN_DIALOGUE = "💬 Dialogue"
 BTN_FULLPROMPT = "📝 Prompt"
 BTN_NEXT = "▶️"
 BTN_THRONE = "👑 Throne"
+BTN_USAGE = "📊 Usage"
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [[BTN_QUICK, BTN_FLEX], [BTN_IMG_EDIT, BTN_THRONE], [BTN_SETTINGS]],
@@ -207,7 +213,7 @@ SETTINGS_KEYBOARD = ReplyKeyboardMarkup(
      [BTN_SET_COUNT, BTN_SET_IMAGE],
      [BTN_SET_IMG_QUALITY, BTN_SET_IMG_SIZE],
      [BTN_EDIT_PROMPT, BTN_VIEW_PROMPT, BTN_RESET_PROMPT],
-     [BTN_BACK]],
+     [BTN_USAGE, BTN_BACK]],
     resize_keyboard=True, one_time_keyboard=False,
 )
 # Pickers (built dynamically from the option lists).
@@ -275,7 +281,7 @@ def _revoke_image_user(uid: int) -> None:
     _save_state(state)
 
 
-def _grant_full_user(uid: int) -> None:
+def _grant_full_user(uid: int, name: str = "") -> None:
     """Grant full access (video + image + quick) dynamically."""
     state = _load_state()
     full = set(state.get("full_users", []))
@@ -284,7 +290,18 @@ def _grant_full_user(uid: int) -> None:
     img = set(state.get("image_users", []))
     img.add(uid)
     state["image_users"] = list(img)
+    # Store name if provided
+    names = state.get("user_names", {})
+    if name:
+        names[str(uid)] = name
+    state["user_names"] = names
     _save_state(state)
+
+
+def _get_user_name(uid: int) -> str:
+    """Return stored name for a user, or their ID as string."""
+    state = _load_state()
+    return state.get("user_names", {}).get(str(uid), str(uid))
 
 
 def _revoke_full_user(uid: int) -> None:
@@ -298,6 +315,58 @@ def _revoke_full_user(uid: int) -> None:
 
 def _get_full_users() -> set[int]:
     return set(_load_state().get("full_users", []))
+
+
+# ---------------------------------------------------------------------------
+# Per-user credit usage tracking (estimated cost, not balance diff)
+# ---------------------------------------------------------------------------
+def _estimate_video_cost(duration: int, quality: str, count: int = 1) -> float:
+    """Estimate video generation cost in credits."""
+    cps = QUALITY_CREDITS_PER_SEC.get(quality, 4.2)
+    return round(duration * cps * count, 3)
+
+
+def _estimate_image_edit_cost(quality: str) -> float:
+    """Estimate image edit cost in credits (doubao model, not gpt-image-2)."""
+    return IMAGE_EDIT_CREDITS.get(quality, 4.743)
+
+
+def _log_usage(uid: int, credits_used: float, mode: str) -> None:
+    """Append an estimated usage record for a user."""
+    if credits_used <= 0:
+        return
+    state = _load_state()
+    log_key = f"usage_log_{uid}"
+    entries = state.get(log_key, [])
+    entries.append({
+        "ts": datetime.datetime.utcnow().isoformat(timespec="seconds"),
+        "credits": round(credits_used, 4),
+        "mode": mode,
+    })
+    state[log_key] = entries[-500:]
+    _save_state(state)
+
+
+def _get_usage(uid: int, since: datetime.datetime | None = None) -> list[dict]:
+    """Return usage records for a user, optionally filtered by date."""
+    state = _load_state()
+    entries = state.get(f"usage_log_{uid}", [])
+    if since is None:
+        return entries
+    return [e for e in entries if e["ts"] >= since.isoformat(timespec="seconds")]
+
+
+def _all_tracked_uids() -> list[int]:
+    """Return all user IDs that have usage records."""
+    state = _load_state()
+    uids = []
+    for key in state:
+        if key.startswith("usage_log_"):
+            try:
+                uids.append(int(key[len("usage_log_"):]))
+            except ValueError:
+                pass
+    return sorted(uids)
 
 
 def image_authorised(update: Update) -> bool:
@@ -317,6 +386,13 @@ def get_user_keyboard(update: Update):
 # Persistent state (default image URL + custom prompt template)
 # ---------------------------------------------------------------------------
 def _load_state() -> dict:
+    # Try env var first (Railway persistent env var), then file.
+    raw = os.environ.get(STATE_JSON_ENV, "").strip()
+    if raw:
+        try:
+            return json.loads(raw) or {}
+        except Exception:  # noqa: BLE001
+            pass
     try:
         with open(STATE_FILE, "r") as f:
             return json.load(f) or {}
@@ -325,11 +401,17 @@ def _load_state() -> dict:
 
 
 def _save_state(state: dict) -> None:
+    """Persist state to file AND print the Railway env var update instruction."""
+    serialised = json.dumps(state)
+    # Always write to file for local dev / same-container persistence
     try:
         with open(STATE_FILE, "w") as f:
-            json.dump(state, f)
+            f.write(serialised)
     except Exception:  # noqa: BLE001
         log.warning("could not persist state to %s", STATE_FILE)
+    # Print the env var value so Railway auto-deploy can pick it up
+    # (set STATE_JSON in Railway variables to this value for cross-deploy persistence)
+    log.info("STATE_SNAPSHOT: %s", serialised)
 
 
 def _user_key(uid: int, key: str) -> str:
@@ -622,7 +704,7 @@ async def submit_gpt_image_job(session: aiohttp.ClientSession, prompt: str,
         return task_id
 
 
-async def run_throne_edit(bot, chat_id: int, time_str: str, amount: int, variant: str = "failed") -> None:
+async def run_throne_edit(bot, chat_id: int, time_str: str, amount: int, variant: str = "failed", uid: int | None = None) -> None:
     """Edit both Throne template images with the given time and amount.
 
     Image 1 (gift list): The top row shows a "Failed" gift. Change the number
@@ -716,6 +798,8 @@ async def run_throne_edit(bot, chat_id: int, time_str: str, amount: int, variant
             credits_after = await get_credits(session)
             if credits_after is not None and credits_before is not None:
                 used = max(credits_before - credits_after, 0)
+                if uid is not None:
+                    _log_usage(uid, used, "throne")
                 await bot.send_message(chat_id,
                     f"💳 {used:.2f} · {credits_after:.2f} left")
             elif credits_after is not None:
@@ -1058,7 +1142,8 @@ async def throne_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cleanup(update, context)
 
     asyncio.create_task(
-        run_throne_edit(context.bot, update.effective_chat.id, time_str, amount, variant)
+        run_throne_edit(context.bot, update.effective_chat.id, time_str, amount, variant,
+                        uid=update.effective_user.id)
     )
 
     label = "Failed" if variant == "failed" else "Cancelled"
@@ -1169,6 +1254,8 @@ async def img_edit_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     await cleanup(update, context)
+    _uid = update.effective_user.id
+    _log_usage(_uid, _estimate_image_edit_cost(get_image_quality()), "image_edit")
     asyncio.create_task(run_image_edit(
         context.bot, update.effective_chat.id,
         prompt=prompt, image_bytes_list=img_list,
@@ -1260,11 +1347,14 @@ async def quick_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cleanup(update, context)
     prompt = load_template(uid).format(dialogue=dialogue)
     # Snapshot settings and fire background task
+    _uid = update.effective_user.id
+    _log_usage(_uid, _estimate_video_cost(get_duration(), get_quality(), get_count()), "quick")
     asyncio.create_task(run_generation(
         context.bot, update.effective_chat.id,
         prompt=prompt, caption=dialogue, image_url=image_url,
         duration=get_duration(), quality=get_quality(),
         aspect_ratio=get_aspect(), count=get_count(),
+        uid=_uid, mode="quick",
     ))
     await close_msg(update, context, "⏳ Queued. You can start another.")
     return ConversationHandler.END
@@ -1378,11 +1468,14 @@ async def flex_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await cleanup(update, context)
     # Snapshot settings and fire background task
+    _uid = update.effective_user.id
+    _log_usage(_uid, _estimate_video_cost(get_duration(), get_quality(), get_count()), "flex")
     asyncio.create_task(run_generation(
         context.bot, update.effective_chat.id,
         prompt=prompt, caption=caption, image_bytes=img_bytes,
         duration=get_duration(), quality=get_quality(),
         aspect_ratio=get_aspect(), count=get_count(),
+        uid=_uid, mode="flex",
     ))
     await close_msg(update, context, "⏳ Queued. You can start another.")
     return ConversationHandler.END
@@ -1500,6 +1593,30 @@ async def settings_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                   "auto = match input aspect.",
                   IMG_SIZE_KEYBOARD)
         return PICK_IMG_SIZE
+
+    if update.message.text == BTN_USAGE:
+        uid = update.effective_user.id
+        now = datetime.datetime.utcnow()
+        def _usage_total(since):
+            entries = _get_usage(uid, since)
+            entries = [e for e in entries if e.get("mode") != "throne"]
+            return sum(e["credits"] for e in entries)
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        week_start = now - datetime.timedelta(days=7)
+        month_start = now - datetime.timedelta(days=30)
+        name = _get_user_name(uid)
+        text = (
+            f"📊 Your usage — {name}\n"
+            "──────────────\n"
+            f"Today       : {_usage_total(today_start):.1f} cr\n"
+            f"Last 7 days : {_usage_total(week_start):.1f} cr\n"
+            f"Last 30 days: {_usage_total(month_start):.1f} cr\n"
+            f"All time    : {_usage_total(None):.1f} cr\n"
+            "──────────────\n"
+            "ℹ️ Estimated costs (excludes Throne)"
+        )
+        await say(update, context, text, SETTINGS_KEYBOARD)
+        return SET_IMAGE_WAIT
 
     if update.message.text == BTN_VIEW_PROMPT:
         # Show the active template, tracked so it clears on Back/Cancel/next action.
@@ -1693,52 +1810,152 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def grant_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin: /grant <user_id> — give full access (video + image + quick + throne)."""
+    """Admin: /grant <uid> [name] [uid2] [name2] ...
+    Each ID can be followed by a name (non-numeric). E.g.:
+      /grant 123456 Alice 789012 Bob 345678
+    """
     if not authorised(update):
         return
     if not context.args:
-        await update.message.reply_text("/grant <user_id>")
+        await update.message.reply_text("/grant <user_id> [name] [user_id2] [name2] ...")
         return
-    try:
-        uid = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("Not a valid user ID.")
-        return
-    _grant_full_user(uid)
-    await update.message.reply_text(
-        f"✅ {uid} granted full access (video + image + quick + throne).")
+    ok, bad = [], []
+    args = list(context.args)
+    while args:
+        arg = args.pop(0)
+        try:
+            uid = int(arg)
+            # Check if next token is a name (non-numeric)
+            name = ""
+            if args and not args[0].lstrip("-").isdigit():
+                name = args.pop(0)
+            _grant_full_user(uid, name)
+            label = f"{uid} ({name})" if name else str(uid)
+            ok.append(label)
+        except ValueError:
+            bad.append(arg)
+    lines = []
+    if ok:
+        lines.append("✅ Granted full access: " + ", ".join(ok))
+    if bad:
+        lines.append("⚠️ Skipped (not valid IDs): " + ", ".join(bad))
+    await update.message.reply_text("\n".join(lines))
 
 
 async def revoke_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin: /revoke <user_id> — remove all dynamic access."""
+    """Admin: /revoke <uid1> [uid2 ...] — remove access from one or more users."""
     if not authorised(update):
         return
     if not context.args:
-        await update.message.reply_text("/revoke <user_id>")
+        await update.message.reply_text("/revoke <user_id> [user_id2 ...]")
         return
-    try:
-        uid = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("Not a valid user ID.")
-        return
-    _revoke_full_user(uid)
-    await update.message.reply_text(f"❌ {uid} fully revoked.")
+    ok, bad = [], []
+    for arg in context.args:
+        try:
+            uid = int(arg)
+            _revoke_full_user(uid)
+            ok.append(uid)
+        except ValueError:
+            bad.append(arg)
+    lines = []
+    if ok:
+        lines.append("❌ Revoked: " + ", ".join(str(u) for u in ok))
+    if bad:
+        lines.append("⚠️ Skipped (not valid IDs): " + ", ".join(bad))
+    await update.message.reply_text("\n".join(lines))
 
 
 async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin: /users — list all granted users."""
+    """Admin: /users — list all granted users with names."""
     if not authorised(update):
         return
     full_users = _get_full_users()
     img_only = _get_image_users() - full_users
+    def fmt(uid):
+        name = _get_user_name(uid)
+        return f"{name} ({uid})" if name != str(uid) else str(uid)
     lines = []
     if full_users:
-        lines.append("Full access: " + ", ".join(str(u) for u in sorted(full_users)))
+        lines.append("Full access:\n" + "\n".join(f"  {fmt(u)}" for u in sorted(full_users)))
     if img_only:
-        lines.append("Image only: " + ", ".join(str(u) for u in sorted(img_only)))
+        lines.append("Image only:\n" + "\n".join(f"  {fmt(u)}" for u in sorted(img_only)))
     if not lines:
         await update.message.reply_text("No granted users.")
         return
+    await update.message.reply_text("\n".join(lines))
+
+
+async def usage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: /usage [period] [user_id]
+    period: today | week | month | all  (default: today)
+    user_id: optional, show one user; omit for all tracked users.
+    Examples:
+      /usage                → all users, today
+      /usage week           → all users, last 7 days
+      /usage month 123456   → user 123456, last 30 days
+      /usage all            → all users, all time
+    """
+    if not authorised(update):
+        return
+
+    args = list(context.args or [])
+    period = "today"
+    target_uid = None
+
+    # Parse optional period keyword
+    if args and args[0].lower() in ("today", "week", "month", "all"):
+        period = args.pop(0).lower()
+
+    # Parse optional user_id
+    if args:
+        try:
+            target_uid = int(args[0])
+        except ValueError:
+            await update.message.reply_text(
+                "Usage: /usage [today|week|month|all] [user_id]")
+            return
+
+    now = datetime.datetime.utcnow()
+    if period == "today":
+        since = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        label = "today (UTC)"
+    elif period == "week":
+        since = now - datetime.timedelta(days=7)
+        label = "last 7 days"
+    elif period == "month":
+        since = now - datetime.timedelta(days=30)
+        label = "last 30 days"
+    else:
+        since = None
+        label = "all time"
+
+    uids = [target_uid] if target_uid else _all_tracked_uids()
+    if not uids:
+        await update.message.reply_text("No usage data recorded yet.")
+        return
+
+    lines = [f"📊 Credit usage — {label}"]
+    grand_total = 0.0
+    for uid in uids:
+        entries = _get_usage(uid, since)
+        # Exclude throne (gpt-image-2) from tracked usage
+        entries = [e for e in entries if e.get("mode") != "throne"]
+        if not entries:
+            if target_uid:
+                lines.append(f"  {_get_user_name(uid)}: no data for this period")
+            continue
+        total = sum(e["credits"] for e in entries)
+        grand_total += total
+        by_mode: dict[str, float] = {}
+        for e in entries:
+            by_mode[e["mode"]] = by_mode.get(e["mode"], 0) + e["credits"]
+        breakdown = " | ".join(f'{m}: {v:.2f}' for m, v in sorted(by_mode.items()))
+        name = _get_user_name(uid)
+        lines.append(f"  {name}: {total:.2f} cr  ({breakdown})")
+
+    if len(uids) > 1:
+        lines.append(f"Total: {grand_total:.2f} credits")
+
     await update.message.reply_text("\n".join(lines))
 
 
@@ -1951,6 +2168,7 @@ def main():
     app.add_handler(CommandHandler("grant", grant_cmd))
     app.add_handler(CommandHandler("revoke", revoke_cmd))
     app.add_handler(CommandHandler("users", users_cmd))
+    app.add_handler(CommandHandler("usage", usage_cmd))
     app.add_handler(CallbackQueryHandler(repeat_callback, pattern=r"^(rep|shp|edp|edr|vrep|vshp|vdlg|vprm):"))
     app.add_handler(conv)
     # Catch text/photos after inline button taps (runs only when no conv is active)
