@@ -247,9 +247,9 @@ IMG_SIZE_KEYBOARD = ReplyKeyboardMarkup(
 
 
 def authorised(update: Update) -> bool:
-    """Full access: video + image modes."""
+    """Full access: video + image modes (env ALLOWED_USERS + dynamically granted)."""
     user = update.effective_user
-    return bool(user) and user.id in ALLOWED_USERS
+    return bool(user) and user.id in (ALLOWED_USERS | _get_full_users())
 
 
 def _get_image_users() -> set[int]:
@@ -275,6 +275,31 @@ def _revoke_image_user(uid: int) -> None:
     _save_state(state)
 
 
+def _grant_full_user(uid: int) -> None:
+    """Grant full access (video + image + quick) dynamically."""
+    state = _load_state()
+    full = set(state.get("full_users", []))
+    full.add(uid)
+    state["full_users"] = list(full)
+    img = set(state.get("image_users", []))
+    img.add(uid)
+    state["image_users"] = list(img)
+    _save_state(state)
+
+
+def _revoke_full_user(uid: int) -> None:
+    state = _load_state()
+    for key in ("full_users", "image_users"):
+        users = set(state.get(key, []))
+        users.discard(uid)
+        state[key] = list(users)
+    _save_state(state)
+
+
+def _get_full_users() -> set[int]:
+    return set(_load_state().get("full_users", []))
+
+
 def image_authorised(update: Update) -> bool:
     """Image edit access: ALLOWED_USERS (full) + IMAGE_USERS (image only)."""
     user = update.effective_user
@@ -283,8 +308,7 @@ def image_authorised(update: Update) -> bool:
 
 def get_user_keyboard(update: Update):
     """Return the right main keyboard for this user's access level."""
-    user = update.effective_user
-    if user and user.id in ALLOWED_USERS:
+    if authorised(update):
         return MAIN_KEYBOARD
     return IMAGE_ONLY_KEYBOARD
 
@@ -308,30 +332,49 @@ def _save_state(state: dict) -> None:
         log.warning("could not persist state to %s", STATE_FILE)
 
 
-def load_default_image() -> str | None:
-    return _load_state().get("default_image_url")
+def _user_key(uid: int, key: str) -> str:
+    return f"user_{uid}_{key}"
 
 
-def save_default_image(url: str) -> None:
+def load_default_image(uid: int | None = None) -> str | None:
     state = _load_state()
-    state["default_image_url"] = url
+    if uid is not None:
+        per = state.get(_user_key(uid, "image_url"))
+        if per:
+            return per
+    return state.get("default_image_url")
+
+
+def save_default_image(url: str, uid: int | None = None) -> None:
+    state = _load_state()
+    if uid is not None:
+        state[_user_key(uid, "image_url")] = url
+    else:
+        state["default_image_url"] = url
     _save_state(state)
 
 
-def load_template() -> str:
-    """Saved custom template if set, else the built-in PROMPT_TEMPLATE."""
-    return _load_state().get("prompt_template") or PROMPT_TEMPLATE
-
-
-def save_template(text: str) -> None:
+def load_template(uid: int | None = None) -> str:
+    """Per-user template if set, else global custom, else built-in."""
     state = _load_state()
-    state["prompt_template"] = text
+    if uid is not None:
+        per = state.get(_user_key(uid, "prompt_template"))
+        if per:
+            return per
+    return state.get("prompt_template") or PROMPT_TEMPLATE
+
+
+def save_template(text: str, uid: int | None = None) -> None:
+    state = _load_state()
+    key = _user_key(uid, "prompt_template") if uid is not None else "prompt_template"
+    state[key] = text
     _save_state(state)
 
 
-def reset_template() -> None:
+def reset_template(uid: int | None = None) -> None:
     state = _load_state()
-    state.pop("prompt_template", None)
+    key = _user_key(uid, "prompt_template") if uid is not None else "prompt_template"
+    state.pop(key, None)
     _save_state(state)
 
 
@@ -1143,7 +1186,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     kb = get_user_keyboard(update)
     if authorised(update):
-        has_img = "yes" if load_default_image() else "no"
+        has_img = "yes" if load_default_image(update.effective_user.id) else "no"
         await update.message.reply_text(
             "Pick a mode:\n"
             f"⚡ Quick — type only the dialogue (uses your default image; set: {has_img}).\n"
@@ -1167,10 +1210,11 @@ async def quick_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     context.user_data.clear()
     await clear_close(update, context)
-    if not load_default_image():
+    uid = update.effective_user.id
+    if not load_default_image(uid):
         await update.message.reply_text(
-            "No default image yet. Set one in ⚙️ Settings first.",
-            reply_markup=MAIN_KEYBOARD,
+            "No default image yet. Set one in ⚙️ Settings → 🖼️ Image first.",
+            reply_markup=get_user_keyboard(update),
         )
         return ConversationHandler.END
     track(context, update.message.message_id)
@@ -1206,14 +1250,15 @@ async def quick_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return QUICK_CONFIRM
 
     dialogue = context.user_data.get("dialogue")
-    image_url = load_default_image()
+    uid = update.effective_user.id
+    image_url = load_default_image(uid)
     if not dialogue or not image_url:
         await cleanup(update, context)
         await close_msg(update, context, "Lost the details — start again.")
         return ConversationHandler.END
 
     await cleanup(update, context)
-    prompt = load_template().format(dialogue=dialogue)
+    prompt = load_template(uid).format(dialogue=dialogue)
     # Snapshot settings and fire background task
     asyncio.create_task(run_generation(
         context.bot, update.effective_chat.id,
@@ -1325,7 +1370,7 @@ async def flex_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     if mode == "dialogue":
-        prompt = load_template().format(dialogue=text)
+        prompt = load_template(update.effective_user.id).format(dialogue=text)
         caption = text                      # dialogue shown
     else:
         prompt = text
@@ -1344,9 +1389,11 @@ async def flex_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------- SETTINGS ----------
-def settings_overview_text() -> str:
-    img = "set ✅" if load_default_image() else "not set ❌"
-    tpl = "custom" if _load_state().get("prompt_template") else "default"
+def settings_overview_text(uid: int | None = None) -> str:
+    img = "set ✅" if load_default_image(uid) else "not set ❌"
+    state = _load_state()
+    has_tpl = bool(uid and state.get(_user_key(uid, "prompt_template"))) or bool(state.get("prompt_template"))
+    tpl = "custom" if has_tpl else "default"
     dur = get_duration()
     qual = get_quality()
     cnt = get_count()
@@ -1372,8 +1419,9 @@ def settings_overview_text() -> str:
 
 
 async def show_settings(update, context):
+    uid = update.effective_user.id if update.effective_user else None
     if authorised(update):
-        await say(update, context, settings_overview_text(), SETTINGS_KEYBOARD)
+        await say(update, context, settings_overview_text(uid), SETTINGS_KEYBOARD)
     else:
         text = (
             "⚙️ Image Settings\n"
@@ -1457,14 +1505,14 @@ async def settings_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Show the active template, tracked so it clears on Back/Cancel/next action.
         m = await update.message.reply_text(
             "Current template (use {dialogue} where the line goes):\n\n"
-            + load_template()
+            + load_template(update.effective_user.id)
         )
         track(context, m.message_id)
         await say(update, context, "Anything else?", SETTINGS_KEYBOARD)
         return SET_IMAGE_WAIT
 
     if update.message.text == BTN_RESET_PROMPT:
-        reset_template()
+        reset_template(uid=update.effective_user.id)
         await say(update, context, "♻️ Template reset to the built-in default.",
                   SETTINGS_KEYBOARD)
         return await show_settings(update, context)
@@ -1497,7 +1545,7 @@ async def settings_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         async with aiohttp.ClientSession() as session:
             url = await upload_image(session, img_bytes)
-        save_default_image(url)
+        save_default_image(url, uid=update.effective_user.id)
         await cleanup(update, context)
         await close_msg(update, context, "✅ Default image saved.")
     except Exception as e:  # noqa: BLE001
@@ -1533,7 +1581,7 @@ async def edit_prompt_wait(update: Update, context: ContextTypes.DEFAULT_TYPE):
                   BACK_CANCEL_KEYBOARD)
         return EDIT_PROMPT_WAIT
 
-    save_template(text)
+    save_template(text, uid=update.effective_user.id)
     await cleanup(update, context)
     await close_msg(update, context, "✅ Prompt template saved.")
     return ConversationHandler.END
@@ -1645,7 +1693,7 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def grant_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin: /grant <user_id> — give image-only access."""
+    """Admin: /grant <user_id> — give full access (video + image + quick + throne)."""
     if not authorised(update):
         return
     if not context.args:
@@ -1656,12 +1704,13 @@ async def grant_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("Not a valid user ID.")
         return
-    _grant_image_user(uid)
-    await update.message.reply_text(f"✅ {uid} granted image access.")
+    _grant_full_user(uid)
+    await update.message.reply_text(
+        f"✅ {uid} granted full access (video + image + quick + throne).")
 
 
 async def revoke_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin: /revoke <user_id> — remove image-only access."""
+    """Admin: /revoke <user_id> — remove all dynamic access."""
     if not authorised(update):
         return
     if not context.args:
@@ -1672,20 +1721,25 @@ async def revoke_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("Not a valid user ID.")
         return
-    _revoke_image_user(uid)
-    await update.message.reply_text(f"❌ {uid} revoked.")
+    _revoke_full_user(uid)
+    await update.message.reply_text(f"❌ {uid} fully revoked.")
 
 
 async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin: /users — list image-only users."""
+    """Admin: /users — list all granted users."""
     if not authorised(update):
         return
-    img_users = _get_image_users()
-    if not img_users:
-        await update.message.reply_text("No image users.")
+    full_users = _get_full_users()
+    img_only = _get_image_users() - full_users
+    lines = []
+    if full_users:
+        lines.append("Full access: " + ", ".join(str(u) for u in sorted(full_users)))
+    if img_only:
+        lines.append("Image only: " + ", ".join(str(u) for u in sorted(img_only)))
+    if not lines:
+        await update.message.reply_text("No granted users.")
         return
-    lines = [str(uid) for uid in sorted(img_users)]
-    await update.message.reply_text("Image users:\n" + "\n".join(lines))
+    await update.message.reply_text("\n".join(lines))
 
 
 async def repeat_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1910,4 +1964,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
