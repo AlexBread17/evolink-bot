@@ -159,6 +159,10 @@ BTN_FULLPROMPT = "📝 Prompt"
 BTN_NEXT = "▶️"
 BTN_THRONE = "👑 Throne"
 BTN_USAGE = "📊 Usage"
+BTN_USAGE_DAY   = "📅 Day"
+BTN_USAGE_WEEK  = "📆 Week"
+BTN_USAGE_MONTH = "🗓️ Month"
+BTN_USAGE_ALL   = "♾️ All time"
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [[BTN_QUICK, BTN_FLEX], [BTN_IMG_EDIT, BTN_THRONE], [BTN_SETTINGS]],
@@ -242,6 +246,13 @@ IMG_SIZE_KEYBOARD = ReplyKeyboardMarkup(
     resize_keyboard=True, one_time_keyboard=False,
 )
 
+USAGE_PERIOD_KEYBOARD = ReplyKeyboardMarkup(
+    [[BTN_USAGE_DAY, BTN_USAGE_WEEK],
+     [BTN_USAGE_MONTH, BTN_USAGE_ALL],
+     [BTN_BACK]],
+    resize_keyboard=True, one_time_keyboard=False,
+)
+
 # Conversation states
 (QUICK_DIALOGUE, QUICK_CONFIRM,
  FLEX_IMAGE, FLEX_PROMPTTYPE, FLEX_TEXT, FLEX_CONFIRM,
@@ -249,7 +260,8 @@ IMG_SIZE_KEYBOARD = ReplyKeyboardMarkup(
  PICK_DURATION, PICK_QUALITY, PICK_ASPECT, PICK_COUNT,
  PICK_IMG_QUALITY, PICK_IMG_SIZE,
  IMG_EDIT_PHOTO, IMG_EDIT_REFS, IMG_EDIT_TEXT, IMG_EDIT_CONFIRM,
- THRONE_WAIT) = range(19)
+ THRONE_WAIT,
+ USAGE_PERIOD, USAGE_USER) = range(21)
 
 
 def authorised(update: Update) -> bool:
@@ -302,6 +314,70 @@ def _get_user_name(uid: int) -> str:
     """Return stored name for a user, or their ID as string."""
     state = _load_state()
     return state.get("user_names", {}).get(str(uid), str(uid))
+
+
+def _usage_keyboard() -> ReplyKeyboardMarkup:
+    """Build a keyboard with one button per tracked user + Back."""
+    uids = _all_tracked_uids()
+    names = [_get_user_name(u) for u in uids]
+    # Chunk into rows of 3
+    rows = [names[i:i+3] for i in range(0, len(names), 3)]
+    rows.append([BTN_BACK])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, one_time_keyboard=False)
+
+
+def _usage_uid_by_name(name: str) -> int | None:
+    """Reverse-lookup a uid by display name or raw id string."""
+    state = _load_state()
+    names = state.get("user_names", {})
+    # Try exact name match
+    for uid_str, n in names.items():
+        if n == name:
+            return int(uid_str)
+    # Try raw id
+    try:
+        return int(name)
+    except ValueError:
+        return None
+
+
+def _usage_summary(uids: list[int], since: datetime.datetime | None, label: str) -> str:
+    """Build a usage summary string for a list of uids."""
+    lines = [f"📊 Credit usage — {label}"]
+    grand = 0.0
+    any_data = False
+    for uid in uids:
+        entries = _get_usage(uid, since)
+        entries = [e for e in entries if e.get("mode") != "throne"]
+        if not entries:
+            continue
+        any_data = True
+        total = sum(e["credits"] for e in entries)
+        grand += total
+        by_mode: dict[str, float] = {}
+        for e in entries:
+            by_mode[e["mode"]] = by_mode.get(e["mode"], 0) + e["credits"]
+        breakdown = " | ".join(f"{m}: {v:.1f}" for m, v in sorted(by_mode.items()))
+        name = _get_user_name(uid)
+        lines.append(f"  {name}: {total:.1f} cr  ({breakdown})")
+    if not any_data:
+        lines.append("  No data for this period.")
+    if len(uids) > 1 and any_data:
+        lines.append(f"  ─────────────")
+        lines.append(f"  Total: {grand:.1f} cr")
+    lines.append("ℹ️ Estimates — excludes Throne")
+    return "\n".join(lines)
+
+
+def _since_for_period(period_btn: str) -> tuple[datetime.datetime | None, str]:
+    now = datetime.datetime.utcnow()
+    if period_btn == BTN_USAGE_DAY:
+        return now.replace(hour=0, minute=0, second=0, microsecond=0), "today"
+    if period_btn == BTN_USAGE_WEEK:
+        return now - datetime.timedelta(days=7), "last 7 days"
+    if period_btn == BTN_USAGE_MONTH:
+        return now - datetime.timedelta(days=30), "last 30 days"
+    return None, "all time"
 
 
 def _revoke_full_user(uid: int) -> None:
@@ -1595,28 +1671,30 @@ async def settings_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return PICK_IMG_SIZE
 
     if update.message.text == BTN_USAGE:
-        uid = update.effective_user.id
+        # Show grand total for all users, then ask for period
+        all_uids = _all_tracked_uids()
         now = datetime.datetime.utcnow()
-        def _usage_total(since):
-            entries = _get_usage(uid, since)
-            entries = [e for e in entries if e.get("mode") != "throne"]
-            return sum(e["credits"] for e in entries)
+        def _grand_total(since):
+            total = 0.0
+            for u in all_uids:
+                entries = [e for e in _get_usage(u, since) if e.get("mode") != "throne"]
+                total += sum(e["credits"] for e in entries)
+            return total
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        week_start = now - datetime.timedelta(days=7)
+        week_start  = now - datetime.timedelta(days=7)
         month_start = now - datetime.timedelta(days=30)
-        name = _get_user_name(uid)
         text = (
-            f"📊 Your usage — {name}\n"
+            "📊 *Usage overview — all users*\n"
             "──────────────\n"
-            f"Today       : {_usage_total(today_start):.1f} cr\n"
-            f"Last 7 days : {_usage_total(week_start):.1f} cr\n"
-            f"Last 30 days: {_usage_total(month_start):.1f} cr\n"
-            f"All time    : {_usage_total(None):.1f} cr\n"
+            f"Today       : {_grand_total(today_start):.1f} cr\n"
+            f"Last 7 days : {_grand_total(week_start):.1f} cr\n"
+            f"Last 30 days: {_grand_total(month_start):.1f} cr\n"
+            f"All time    : {_grand_total(None):.1f} cr\n"
             "──────────────\n"
-            "ℹ️ Estimated costs (excludes Throne)"
+            "Pick a period to see per-user breakdown:"
         )
-        await say(update, context, text, SETTINGS_KEYBOARD)
-        return SET_IMAGE_WAIT
+        await say(update, context, text, USAGE_PERIOD_KEYBOARD)
+        return USAGE_PERIOD
 
     if update.message.text == BTN_VIEW_PROMPT:
         # Show the active template, tracked so it clears on Back/Cancel/next action.
@@ -1788,6 +1866,63 @@ async def pick_img_size(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return PICK_IMG_SIZE
     set_image_size(s)
     return await show_settings(update, context)
+
+
+# ---------- USAGE FLOW ----------
+
+async def usage_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step 2: user picked a period — show per-user breakdown + user picker."""
+    if not image_authorised(update):
+        return ConversationHandler.END
+    track(context, update.message.message_id)
+    text = (update.message.text or "").strip()
+
+    if text == BTN_BACK:
+        return await show_settings(update, context)
+
+    if text not in (BTN_USAGE_DAY, BTN_USAGE_WEEK, BTN_USAGE_MONTH, BTN_USAGE_ALL):
+        await say(update, context, "Pick a period:", USAGE_PERIOD_KEYBOARD)
+        return USAGE_PERIOD
+
+    context.user_data["usage_period_btn"] = text
+    since, label = _since_for_period(text)
+
+    all_uids = _all_tracked_uids()
+    summary = _usage_summary(all_uids, since, label)
+
+    kb = _usage_keyboard()
+    await say(update, context,
+              summary + "\n\n👤 Tap a user for their detailed breakdown:",
+              kb)
+    return USAGE_USER
+
+
+async def usage_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step 3: user tapped a name — show that user's breakdown."""
+    if not image_authorised(update):
+        return ConversationHandler.END
+    track(context, update.message.message_id)
+    text = (update.message.text or "").strip()
+
+    if text == BTN_BACK:
+        # Go back to period picker, re-show overview
+        await say(update, context,
+                  "Pick a period to see per-user breakdown:",
+                  USAGE_PERIOD_KEYBOARD)
+        return USAGE_PERIOD
+
+    period_btn = context.user_data.get("usage_period_btn", BTN_USAGE_ALL)
+    since, label = _since_for_period(period_btn)
+
+    uid = _usage_uid_by_name(text)
+    if uid is None:
+        await say(update, context, "Unknown user — tap a name below:",
+                  _usage_keyboard())
+        return USAGE_USER
+
+    summary = _usage_summary([uid], since, f"{text} — {label}")
+    await say(update, context, summary, _usage_keyboard())
+    return USAGE_USER
 
 
 # ---------- shared cancel ----------
@@ -2156,6 +2291,8 @@ def main():
             IMG_EDIT_REFS: [MessageHandler(img | txt, img_edit_refs)],
             IMG_EDIT_CONFIRM: [MessageHandler(txt, img_edit_confirm)],
             THRONE_WAIT: [MessageHandler(txt, throne_input)],
+            USAGE_PERIOD: [MessageHandler(txt, usage_period)],
+            USAGE_USER:   [MessageHandler(txt, usage_user)],
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
