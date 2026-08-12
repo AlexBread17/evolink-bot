@@ -1430,7 +1430,6 @@ async def quick_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         prompt=prompt, caption=dialogue, image_url=image_url,
         duration=get_duration(), quality=get_quality(),
         aspect_ratio=get_aspect(), count=get_count(),
-        uid=_uid, mode="quick",
     ))
     await close_msg(update, context, "⏳ Queued. You can start another.")
     return ConversationHandler.END
@@ -1551,7 +1550,6 @@ async def flex_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         prompt=prompt, caption=caption, image_bytes=img_bytes,
         duration=get_duration(), quality=get_quality(),
         aspect_ratio=get_aspect(), count=get_count(),
-        uid=_uid, mode="flex",
     ))
     await close_msg(update, context, "⏳ Queued. You can start another.")
     return ConversationHandler.END
