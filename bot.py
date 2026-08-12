@@ -62,7 +62,7 @@ _ENV_IMAGE_USERS = {
 
 # Generation settings. These are DEFAULTS; the live values are saved in state
 # and changed only via the Settings menu.
-MODEL = "seedance-2.0-mini-image-to-video"
+MODEL = "seedance-2.0-fast-image-to-video"
 IMAGE_MODEL = "doubao-seedream-5.0-pro"
 IMAGE_GEN_URL = "https://api.evolink.ai/v1/images/generations"
 DEFAULT_IMAGE_QUALITY = "2K"
@@ -90,8 +90,8 @@ ASPECT_LABELS = {
     "1:1": "1:1 square",
     "21:9": "21:9 cinematic",
 }
-# Credits-per-second by quality — Seedance 2.0 Mini (from EvoLink UI: 4s 480p = 5.5cr).
-QUALITY_CREDITS_PER_SEC = {"480p": 1.375, "720p": 3.31}
+# Credits-per-second by quality — Seedance 2.0 Fast.
+QUALITY_CREDITS_PER_SEC = {"480p": 4.2, "720p": 10.125}
 # Image edit estimated cost by quality (cr per generation, from EvoLink UI).
 IMAGE_EDIT_CREDITS = {"1K": 2.4, "2K": 4.743}
 
@@ -398,7 +398,7 @@ def _get_full_users() -> set[int]:
 # ---------------------------------------------------------------------------
 def _estimate_video_cost(duration: int, quality: str, count: int = 1) -> float:
     """Estimate video generation cost in credits."""
-    cps = QUALITY_CREDITS_PER_SEC.get(quality, 1.375)
+    cps = QUALITY_CREDITS_PER_SEC.get(quality, 4.2)
     return round(duration * cps * count, 3)
 
 
