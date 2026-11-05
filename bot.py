@@ -95,6 +95,27 @@ QUALITY_CREDITS_PER_SEC = {"480p": 4.2, "720p": 10.125}
 # Image edit estimated cost by quality (cr per generation, from EvoLink UI).
 IMAGE_EDIT_CREDITS = {"1K": 2.4, "2K": 4.743}
 
+# ---- Video models (per-user choice in Settings → 🎬 Model) ----
+# Settings (length/quality) are shared; each model maps them to what it supports.
+VIDEO_MODELS = {
+    "seedance": {
+        "label": "Seedance 2.0 Fast",
+        "api": MODEL,
+    },
+    "minimax": {
+        "label": "MiniMax H3 Max Turbo",
+        "api": "minimax-h3-max-turbo-image-to-video",
+        # 5–15s only; 480p/768p; aspect follows the input image; no audio params.
+        "min_duration": 5,
+        "max_duration": 15,
+        "quality_map": {"480p": "480p", "720p": "768p"},
+    },
+}
+DEFAULT_VIDEO_MODEL = "seedance"
+# MiniMax credits-per-second. 480p from EvoLink UI (8.075 cr / 5s).
+# 768p price not confirmed — CHECK in the EvoLink UI and update.
+MINIMAX_CREDITS_PER_SEC = {"480p": 1.615, "768p": 3.23}
+
 # Fixed prompt template. {dialogue} is replaced by the line you type.
 PROMPT_TEMPLATE = (
     "She moves with relaxed but lively energy — walking around naturally so the "
@@ -152,6 +173,7 @@ BTN_SET_DURATION = "⏱️ Length"
 BTN_SET_QUALITY = "🎚️ Quality"
 BTN_SET_ASPECT = "📐 Aspect"
 BTN_SET_COUNT = "🔢 Count"
+BTN_SET_MODEL = "🎬 Model"
 BTN_SET_IMG_QUALITY = "🖼️ Img Res"
 BTN_SET_IMG_SIZE = "📐 Img Size"
 BTN_DIALOGUE = "💬 Dialogue"
@@ -214,7 +236,7 @@ CONFIRM_KEYBOARD = ReplyKeyboardMarkup(
 )
 SETTINGS_KEYBOARD = ReplyKeyboardMarkup(
     [[BTN_SET_DURATION, BTN_SET_QUALITY, BTN_SET_ASPECT],
-     [BTN_SET_COUNT, BTN_SET_IMAGE],
+     [BTN_SET_MODEL, BTN_SET_COUNT, BTN_SET_IMAGE],
      [BTN_SET_IMG_QUALITY, BTN_SET_IMG_SIZE],
      [BTN_EDIT_PROMPT, BTN_VIEW_PROMPT, BTN_RESET_PROMPT],
      [BTN_USAGE, BTN_BACK]],
@@ -231,6 +253,10 @@ QUALITY_KEYBOARD = ReplyKeyboardMarkup(
 )
 ASPECT_KEYBOARD = ReplyKeyboardMarkup(
     [ASPECT_OPTIONS[:3], ASPECT_OPTIONS[3:], [BTN_BACK]],
+    resize_keyboard=True, one_time_keyboard=False,
+)
+MODEL_KEYBOARD = ReplyKeyboardMarkup(
+    [[m["label"] for m in VIDEO_MODELS.values()], [BTN_BACK]],
     resize_keyboard=True, one_time_keyboard=False,
 )
 COUNT_KEYBOARD = ReplyKeyboardMarkup(
@@ -261,7 +287,8 @@ USAGE_PERIOD_KEYBOARD = ReplyKeyboardMarkup(
  PICK_IMG_QUALITY, PICK_IMG_SIZE,
  IMG_EDIT_PHOTO, IMG_EDIT_REFS, IMG_EDIT_TEXT, IMG_EDIT_CONFIRM,
  THRONE_WAIT,
- USAGE_PERIOD, USAGE_USER) = range(21)
+ USAGE_PERIOD, USAGE_USER,
+ PICK_MODEL) = range(22)
 
 
 def authorised(update: Update) -> bool:
@@ -396,9 +423,26 @@ def _get_full_users() -> set[int]:
 # ---------------------------------------------------------------------------
 # Per-user credit usage tracking (estimated cost, not balance diff)
 # ---------------------------------------------------------------------------
-def _estimate_video_cost(duration: int, quality: str, count: int = 1) -> float:
+def _effective_video_params(model: str, duration: int, quality: str) -> tuple[int, str]:
+    """Map the shared Settings (length/quality) onto what MODEL supports."""
+    cfg = VIDEO_MODELS.get(model, VIDEO_MODELS[DEFAULT_VIDEO_MODEL])
+    lo, hi = cfg.get("min_duration"), cfg.get("max_duration")
+    if lo is not None:
+        duration = max(lo, duration)
+    if hi is not None:
+        duration = min(hi, duration)
+    quality = cfg.get("quality_map", {}).get(quality, quality)
+    return duration, quality
+
+
+def _estimate_video_cost(duration: int, quality: str, count: int = 1,
+                         model: str = DEFAULT_VIDEO_MODEL) -> float:
     """Estimate video generation cost in credits."""
-    cps = QUALITY_CREDITS_PER_SEC.get(quality, 4.2)
+    duration, quality = _effective_video_params(model, duration, quality)
+    if model == "minimax":
+        cps = MINIMAX_CREDITS_PER_SEC.get(quality, 1.615)
+    else:
+        cps = QUALITY_CREDITS_PER_SEC.get(quality, 4.2)
     return round(duration * cps * count, 3)
 
 
@@ -580,6 +624,18 @@ def set_count(n: int) -> None:
     _save_state(state)
 
 
+def get_video_model(uid: int | None = None) -> str:
+    state = _load_state()
+    val = state.get(_user_key(uid, "video_model")) if uid is not None else None
+    return val if val in VIDEO_MODELS else DEFAULT_VIDEO_MODEL
+
+
+def set_video_model(model: str, uid: int) -> None:
+    state = _load_state()
+    state[_user_key(uid, "video_model")] = model
+    _save_state(state)
+
+
 def get_image_quality() -> str:
     val = _load_state().get("image_quality")
     return val if val in IMAGE_QUALITY_OPTIONS else DEFAULT_IMAGE_QUALITY
@@ -622,17 +678,27 @@ async def upload_image(session: aiohttp.ClientSession, img_bytes: bytes,
 
 async def submit_job(session: aiohttp.ClientSession, prompt: str,
                      image_url: str, *, duration: int, quality: str,
-                     aspect_ratio: str) -> str:
-    payload = {
-        "model": MODEL,
-        "prompt": prompt,
-        "image_urls": [image_url],
-        "duration": duration,
-        "quality": quality,
-        "aspect_ratio": aspect_ratio,
-        "generate_audio": GENERATE_AUDIO,
-        "content_filter": CONTENT_FILTER,
-    }
+                     aspect_ratio: str, model: str = DEFAULT_VIDEO_MODEL) -> str:
+    if model == "minimax":
+        duration, quality = _effective_video_params(model, duration, quality)
+        payload = {
+            "model": VIDEO_MODELS["minimax"]["api"],
+            "prompt": prompt[:7000],
+            "image_start": image_url,
+            "duration": duration,
+            "quality": quality,
+        }
+    else:
+        payload = {
+            "model": MODEL,
+            "prompt": prompt,
+            "image_urls": [image_url],
+            "duration": duration,
+            "quality": quality,
+            "aspect_ratio": aspect_ratio,
+            "generate_audio": GENERATE_AUDIO,
+            "content_filter": CONTENT_FILTER,
+        }
     headers = {"Authorization": f"Bearer {EVOLINK_KEY}"}
     async with session.post(GEN_URL, json=payload, headers=headers) as r:
         body = await r.json()
@@ -640,6 +706,8 @@ async def submit_job(session: aiohttp.ClientSession, prompt: str,
             raise RuntimeError("EvoLink rejected the key (401). Check it in the dashboard.")
         if r.status == 402:
             raise RuntimeError("EvoLink balance too low (402). Top up credits.")
+        if r.status == 403:
+            raise RuntimeError(f"EvoLink key has no access to this model (403): {body}")
         if r.status >= 400:
             raise RuntimeError(f"Submit error {r.status}: {body}")
         task_id = body.get("id")
@@ -949,7 +1017,8 @@ async def close_msg(update, context, text, keyboard=None):
 # Generation core (shared by all modes) — runs as background task
 # ---------------------------------------------------------------------------
 async def run_generation(bot, chat_id, *, prompt, caption, image_url=None,
-                         image_bytes=None, duration, quality, aspect_ratio, count):
+                         image_bytes=None, duration, quality, aspect_ratio, count,
+                         model=DEFAULT_VIDEO_MODEL):
     """Upload (if needed), generate COUNT clip(s), send each with the caption.
 
     Runs as an asyncio background task — does not block the conversation.
@@ -972,7 +1041,8 @@ async def run_generation(bot, chat_id, *, prompt, caption, image_url=None,
                 try:
                     task_id = await submit_job(session, prompt, image_url,
                                               duration=duration, quality=quality,
-                                              aspect_ratio=aspect_ratio)
+                                              aspect_ratio=aspect_ratio,
+                                              model=model)
                     await status.edit_text(f"Working{tag}… (task {task_id[:18]})")
                     video_url = await poll_job(session, task_id)
                     data, size = await fetch_bytes(session, video_url)
@@ -992,6 +1062,7 @@ async def run_generation(bot, chat_id, *, prompt, caption, image_url=None,
                     "duration": duration,
                     "quality": quality,
                     "aspect_ratio": aspect_ratio,
+                    "model": model,
                     "count": 1,
                     "chat_id": chat_id,
                 }
@@ -1424,12 +1495,13 @@ async def quick_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prompt = load_template(uid).format(dialogue=dialogue)
     # Snapshot settings and fire background task
     _uid = update.effective_user.id
-    _log_usage(_uid, _estimate_video_cost(get_duration(), get_quality(), get_count()), "quick")
+    _model = get_video_model(_uid)
+    _log_usage(_uid, _estimate_video_cost(get_duration(), get_quality(), get_count(), _model), "quick")
     asyncio.create_task(run_generation(
         context.bot, update.effective_chat.id,
         prompt=prompt, caption=dialogue, image_url=image_url,
         duration=get_duration(), quality=get_quality(),
-        aspect_ratio=get_aspect(), count=get_count(),
+        aspect_ratio=get_aspect(), count=get_count(), model=_model,
     ))
     await close_msg(update, context, "⏳ Queued. You can start another.")
     return ConversationHandler.END
@@ -1544,12 +1616,13 @@ async def flex_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cleanup(update, context)
     # Snapshot settings and fire background task
     _uid = update.effective_user.id
-    _log_usage(_uid, _estimate_video_cost(get_duration(), get_quality(), get_count()), "flex")
+    _model = get_video_model(_uid)
+    _log_usage(_uid, _estimate_video_cost(get_duration(), get_quality(), get_count(), _model), "flex")
     asyncio.create_task(run_generation(
         context.bot, update.effective_chat.id,
         prompt=prompt, caption=caption, image_bytes=img_bytes,
         duration=get_duration(), quality=get_quality(),
-        aspect_ratio=get_aspect(), count=get_count(),
+        aspect_ratio=get_aspect(), count=get_count(), model=_model,
     ))
     await close_msg(update, context, "⏳ Queued. You can start another.")
     return ConversationHandler.END
@@ -1564,19 +1637,25 @@ def settings_overview_text(uid: int | None = None) -> str:
     dur = get_duration()
     qual = get_quality()
     cnt = get_count()
-    cps = QUALITY_CREDITS_PER_SEC.get(qual, 0)
-    est = dur * cps * cnt
+    model = get_video_model(uid)
+    eff_dur, eff_qual = _effective_video_params(model, dur, qual)
+    clip = _estimate_video_cost(dur, qual, 1, model)
+    est = clip * cnt
     per_submit = f" (×{cnt} = {est:.0f} per submit)" if cnt > 1 else ""
+    dur_note = f" → {eff_dur}s on this model" if eff_dur != dur else ""
+    qual_note = f" → {eff_qual} on this model" if eff_qual != qual else ""
+    aspect_note = " (follows image on this model)" if model == "minimax" else ""
     return (
         "⚙️ Settings — current setup\n"
         "── Video ──────────\n"
-        f"⏱️ Length   :  {dur}s\n"
-        f"🎚️ Quality  :  {qual}\n"
-        f"📐 Aspect   :  {ASPECT_LABELS.get(get_aspect(), get_aspect())}\n"
+        f"🎬 Model    :  {VIDEO_MODELS[model]['label']}\n"
+        f"⏱️ Length   :  {dur}s{dur_note}\n"
+        f"🎚️ Quality  :  {qual}{qual_note}\n"
+        f"📐 Aspect   :  {ASPECT_LABELS.get(get_aspect(), get_aspect())}{aspect_note}\n"
         f"🔢 Count    :  {cnt} per submit\n"
         f"🖼️ Image    :  {img}\n"
         f"📝 Template :  {tpl}\n"
-        f"≈ {dur*cps:.0f} credits per clip{per_submit}\n"
+        f"≈ {clip:.0f} credits per clip{per_submit}\n"
         "── Image Edit ─────\n"
         f"🖼️ Img Res  :  {get_image_quality()}\n"
         f"📐 Img Size :  {get_image_size()}\n"
@@ -1641,6 +1720,17 @@ async def settings_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                   f"Pick aspect ratio (current: {get_aspect()}).\n{legend}",
                   ASPECT_KEYBOARD)
         return PICK_ASPECT
+
+    if update.message.text == BTN_SET_MODEL:
+        if not authorised(update):
+            return SET_IMAGE_WAIT
+        current = VIDEO_MODELS[get_video_model(update.effective_user.id)]["label"]
+        await say(update, context,
+                  f"Pick video model (current: {current}).\n"
+                  "• Seedance 2.0 Fast — audio + speech, any aspect ratio\n"
+                  "• MiniMax H3 Max Turbo — 5–15s, 480p/768p, aspect follows image",
+                  MODEL_KEYBOARD)
+        return PICK_MODEL
 
     if update.message.text == BTN_SET_COUNT:
         await say(update, context,
@@ -1820,6 +1910,21 @@ async def pick_aspect(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await say(update, context, "Tap one of the ratios, or ⬅️ Back.", ASPECT_KEYBOARD)
         return PICK_ASPECT
     set_aspect(a)
+    return await show_settings(update, context)
+
+
+async def pick_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not authorised(update):
+        return ConversationHandler.END
+    track(context, update.message.message_id)
+    if update.message.text == BTN_BACK:
+        return await show_settings(update, context)
+    label = (update.message.text or "").strip()
+    key = next((k for k, m in VIDEO_MODELS.items() if m["label"] == label), None)
+    if not key:
+        await say(update, context, "Tap one of the models, or ⬅️ Back.", MODEL_KEYBOARD)
+        return PICK_MODEL
+    set_video_model(key, update.effective_user.id)
     return await show_settings(update, context)
 
 
@@ -2150,6 +2255,7 @@ async def repeat_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             image_bytes=params.get("image_bytes"),
             duration=params["duration"], quality=params["quality"],
             aspect_ratio=params["aspect_ratio"], count=1,
+            model=params.get("model", DEFAULT_VIDEO_MODEL),
         ))
 
     elif action == "vshp":
@@ -2202,6 +2308,7 @@ async def img_action_catch(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 image_bytes=params.get("image_bytes"),
                 duration=params["duration"], quality=params["quality"],
                 aspect_ratio=params["aspect_ratio"], count=1,
+                model=params.get("model", DEFAULT_VIDEO_MODEL),
             ))
         elif edit_type == "video_prm":
             asyncio.create_task(run_generation(
@@ -2211,6 +2318,7 @@ async def img_action_catch(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 image_bytes=params.get("image_bytes"),
                 duration=params["duration"], quality=params["quality"],
                 aspect_ratio=params["aspect_ratio"], count=1,
+                model=params.get("model", DEFAULT_VIDEO_MODEL),
             ))
         return
 
@@ -2284,6 +2392,7 @@ def main():
             PICK_QUALITY: [MessageHandler(txt, pick_quality)],
             PICK_ASPECT: [MessageHandler(txt, pick_aspect)],
             PICK_COUNT: [MessageHandler(txt, pick_count)],
+            PICK_MODEL: [MessageHandler(txt, pick_model)],
             PICK_IMG_QUALITY: [MessageHandler(txt, pick_img_quality)],
             PICK_IMG_SIZE: [MessageHandler(txt, pick_img_size)],
             IMG_EDIT_REFS: [MessageHandler(img | txt, img_edit_refs)],
