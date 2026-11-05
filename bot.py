@@ -105,13 +105,15 @@ VIDEO_MODELS = {
     "minimax": {
         "label": "MiniMax H3 Max Turbo",
         "api": "minimax-h3-max-turbo-image-to-video",
-        # 5–15s only; 480p/768p; aspect follows the input image; no audio params.
+        # 5–15s only; 480p/768p; no aspect param (bot crops the input image
+        # to the Aspect setting instead); no audio params.
         "min_duration": 5,
         "max_duration": 15,
-        "quality_map": {"480p": "480p", "720p": "768p"},
     },
 }
 DEFAULT_VIDEO_MODEL = "seedance"
+MINIMAX_QUALITY_OPTIONS = ["480p", "768p"]
+DEFAULT_MINIMAX_QUALITY = "480p"
 # MiniMax credits-per-second. 480p from EvoLink UI (8.075 cr / 5s).
 # 768p price not confirmed — CHECK in the EvoLink UI and update.
 MINIMAX_CREDITS_PER_SEC = {"480p": 1.615, "768p": 3.23}
@@ -257,6 +259,10 @@ ASPECT_KEYBOARD = ReplyKeyboardMarkup(
 )
 MODEL_KEYBOARD = ReplyKeyboardMarkup(
     [[m["label"] for m in VIDEO_MODELS.values()], [BTN_BACK]],
+    resize_keyboard=True, one_time_keyboard=False,
+)
+MINIMAX_QUALITY_KEYBOARD = ReplyKeyboardMarkup(
+    [MINIMAX_QUALITY_OPTIONS, [BTN_BACK]],
     resize_keyboard=True, one_time_keyboard=False,
 )
 COUNT_KEYBOARD = ReplyKeyboardMarkup(
@@ -424,15 +430,35 @@ def _get_full_users() -> set[int]:
 # Per-user credit usage tracking (estimated cost, not balance diff)
 # ---------------------------------------------------------------------------
 def _effective_video_params(model: str, duration: int, quality: str) -> tuple[int, str]:
-    """Map the shared Settings (length/quality) onto what MODEL supports."""
+    """Map the shared Length setting onto what MODEL supports."""
     cfg = VIDEO_MODELS.get(model, VIDEO_MODELS[DEFAULT_VIDEO_MODEL])
     lo, hi = cfg.get("min_duration"), cfg.get("max_duration")
     if lo is not None:
         duration = max(lo, duration)
     if hi is not None:
         duration = min(hi, duration)
-    quality = cfg.get("quality_map", {}).get(quality, quality)
     return duration, quality
+
+
+def _crop_to_aspect(img_bytes: bytes, aspect: str) -> bytes:
+    """Center-crop an image to ASPECT (e.g. "9:16") and return JPEG bytes."""
+    import io
+    from PIL import Image, ImageOps
+    w_r, h_r = (int(x) for x in aspect.split(":"))
+    target = w_r / h_r
+    im = ImageOps.exif_transpose(Image.open(io.BytesIO(img_bytes))).convert("RGB")
+    w, h = im.size
+    if w / h > target:            # too wide -> trim sides
+        new_w = round(h * target)
+        left = (w - new_w) // 2
+        im = im.crop((left, 0, left + new_w, h))
+    elif w / h < target:          # too tall -> trim top/bottom
+        new_h = round(w / target)
+        top = (h - new_h) // 2
+        im = im.crop((0, top, w, top + new_h))
+    out = io.BytesIO()
+    im.save(out, format="JPEG", quality=95)
+    return out.getvalue()
 
 
 def _estimate_video_cost(duration: int, quality: str, count: int = 1,
@@ -634,6 +660,22 @@ def set_video_model(model: str, uid: int) -> None:
     state = _load_state()
     state[_user_key(uid, "video_model")] = model
     _save_state(state)
+
+
+def get_minimax_quality() -> str:
+    val = _load_state().get("minimax_quality")
+    return val if val in MINIMAX_QUALITY_OPTIONS else DEFAULT_MINIMAX_QUALITY
+
+
+def set_minimax_quality(q: str) -> None:
+    state = _load_state()
+    state["minimax_quality"] = q
+    _save_state(state)
+
+
+def get_video_quality(model: str) -> str:
+    """Quality setting for MODEL (each model has its own options)."""
+    return get_minimax_quality() if model == "minimax" else get_quality()
 
 
 def get_image_quality() -> str:
@@ -1031,15 +1073,27 @@ async def run_generation(bot, chat_id, *, prompt, caption, image_url=None,
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             credits_before = await get_credits(session)
-            if image_url is None:
-                image_url = await upload_image(session, image_bytes)
+            orig_image_url = image_url
+            if model == "minimax":
+                # No aspect param on MiniMax: crop the input to the Aspect setting.
+                src = image_bytes
+                if src is None:
+                    src, _ = await fetch_bytes(session, image_url)
+                    if src is None:
+                        raise RuntimeError("Input image too large to crop.")
+                gen_image_url = await upload_image(
+                    session, _crop_to_aspect(src, aspect_ratio))
+            else:
+                if image_url is None:
+                    image_url = await upload_image(session, image_bytes)
+                gen_image_url = image_url
 
             any_sent = False
             for i in range(count):
                 tag = "" if count == 1 else f" {i+1}/{count}"
                 await status.edit_text(f"Generating{tag}… 1–3 min.")
                 try:
-                    task_id = await submit_job(session, prompt, image_url,
+                    task_id = await submit_job(session, prompt, gen_image_url,
                                               duration=duration, quality=quality,
                                               aspect_ratio=aspect_ratio,
                                               model=model)
@@ -1057,7 +1111,7 @@ async def run_generation(bot, chat_id, *, prompt, caption, image_url=None,
                     "type": "video",
                     "prompt": prompt,
                     "caption": caption,
-                    "image_url": image_url,
+                    "image_url": image_url or orig_image_url,
                     "image_bytes": image_bytes,
                     "duration": duration,
                     "quality": quality,
@@ -1496,11 +1550,11 @@ async def quick_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Snapshot settings and fire background task
     _uid = update.effective_user.id
     _model = get_video_model(_uid)
-    _log_usage(_uid, _estimate_video_cost(get_duration(), get_quality(), get_count(), _model), "quick")
+    _log_usage(_uid, _estimate_video_cost(get_duration(), get_video_quality(_model), get_count(), _model), "quick")
     asyncio.create_task(run_generation(
         context.bot, update.effective_chat.id,
         prompt=prompt, caption=dialogue, image_url=image_url,
-        duration=get_duration(), quality=get_quality(),
+        duration=get_duration(), quality=get_video_quality(_model),
         aspect_ratio=get_aspect(), count=get_count(), model=_model,
     ))
     await close_msg(update, context, "⏳ Queued. You can start another.")
@@ -1617,11 +1671,11 @@ async def flex_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Snapshot settings and fire background task
     _uid = update.effective_user.id
     _model = get_video_model(_uid)
-    _log_usage(_uid, _estimate_video_cost(get_duration(), get_quality(), get_count(), _model), "flex")
+    _log_usage(_uid, _estimate_video_cost(get_duration(), get_video_quality(_model), get_count(), _model), "flex")
     asyncio.create_task(run_generation(
         context.bot, update.effective_chat.id,
         prompt=prompt, caption=caption, image_bytes=img_bytes,
-        duration=get_duration(), quality=get_quality(),
+        duration=get_duration(), quality=get_video_quality(_model),
         aspect_ratio=get_aspect(), count=get_count(), model=_model,
     ))
     await close_msg(update, context, "⏳ Queued. You can start another.")
@@ -1635,16 +1689,16 @@ def settings_overview_text(uid: int | None = None) -> str:
     has_tpl = bool(uid and state.get(_user_key(uid, "prompt_template"))) or bool(state.get("prompt_template"))
     tpl = "custom" if has_tpl else "default"
     dur = get_duration()
-    qual = get_quality()
     cnt = get_count()
     model = get_video_model(uid)
+    qual = get_video_quality(model)
     eff_dur, eff_qual = _effective_video_params(model, dur, qual)
     clip = _estimate_video_cost(dur, qual, 1, model)
     est = clip * cnt
     per_submit = f" (×{cnt} = {est:.0f} per submit)" if cnt > 1 else ""
     dur_note = f" → {eff_dur}s on this model" if eff_dur != dur else ""
-    qual_note = f" → {eff_qual} on this model" if eff_qual != qual else ""
-    aspect_note = " (follows image on this model)" if model == "minimax" else ""
+    qual_note = ""
+    aspect_note = " (image cropped to fit)" if model == "minimax" else ""
     return (
         "⚙️ Settings — current setup\n"
         "── Video ──────────\n"
@@ -1704,6 +1758,16 @@ async def settings_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                   DURATION_KEYBOARD)
         return PICK_DURATION
 
+    if update.message.text == BTN_SET_QUALITY and \
+            get_video_model(update.effective_user.id) == "minimax":
+        hints = " · ".join(
+            f"{q} ≈{MINIMAX_CREDITS_PER_SEC.get(q,0):.2f} cr/s" for q in MINIMAX_QUALITY_OPTIONS
+        )
+        await say(update, context,
+                  f"MiniMax quality (current: {get_minimax_quality()}).\n{hints}",
+                  MINIMAX_QUALITY_KEYBOARD)
+        return PICK_QUALITY
+
     if update.message.text == BTN_SET_QUALITY:
         hints = " · ".join(
             f"{q} ≈{QUALITY_CREDITS_PER_SEC.get(q,0):.1f} cr/s" for q in QUALITY_OPTIONS
@@ -1728,7 +1792,7 @@ async def settings_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await say(update, context,
                   f"Pick video model (current: {current}).\n"
                   "• Seedance 2.0 Fast — audio + speech, any aspect ratio\n"
-                  "• MiniMax H3 Max Turbo — 5–15s, 480p/768p, aspect follows image",
+                  "• MiniMax H3 Max Turbo — 5–15s, 480p/768p, image cropped to Aspect",
                   MODEL_KEYBOARD)
         return PICK_MODEL
 
@@ -1892,6 +1956,13 @@ async def pick_quality(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.text == BTN_BACK:
         return await show_settings(update, context)
     q = (update.message.text or "").strip()
+    if get_video_model(update.effective_user.id) == "minimax":
+        if q not in MINIMAX_QUALITY_OPTIONS:
+            await say(update, context, "Tap 480p or 768p, or ⬅️ Back.",
+                      MINIMAX_QUALITY_KEYBOARD)
+            return PICK_QUALITY
+        set_minimax_quality(q)
+        return await show_settings(update, context)
     if q not in QUALITY_OPTIONS:
         await say(update, context, "Tap 480p or 720p, or ⬅️ Back.", QUALITY_KEYBOARD)
         return PICK_QUALITY
