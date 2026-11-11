@@ -1056,6 +1056,52 @@ async def close_msg(update, context, text, keyboard=None):
 
 
 # ---------------------------------------------------------------------------
+# Video note (Telegram circle) conversion
+# ---------------------------------------------------------------------------
+VIDEO_NOTE_SIZE = 640  # px; Telegram's max side for a round video note
+
+
+def _ffmpeg_exe() -> str:
+    """Bundled ffmpeg from imageio-ffmpeg (no system package needed on Railway)."""
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:  # noqa: BLE001
+        return "ffmpeg"
+
+
+async def _to_video_note(data: bytes) -> bytes:
+    """Center-crop a clip to a square and re-encode it as an H.264/AAC MP4.
+
+    Telegram only shows a video as a circle when it is square and at most
+    640px per side; anything else is delivered as a normal video.
+    """
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "in.mp4")
+        dst = os.path.join(tmp, "out.mp4")
+        with open(src, "wb") as f:
+            f.write(data)
+        proc = await asyncio.create_subprocess_exec(
+            _ffmpeg_exe(), "-y", "-i", src,
+            "-vf", (f"crop='min(iw,ih)':'min(iw,ih)',"
+                    f"scale={VIDEO_NOTE_SIZE}:{VIDEO_NOTE_SIZE},setsar=1"),
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "128k",
+            "-movflags", "+faststart", "-t", "60",
+            dst,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, err = await proc.communicate()
+        if proc.returncode != 0:
+            raise RuntimeError(f"ffmpeg failed: {err.decode(errors='ignore')[-300:]}")
+        with open(dst, "rb") as f:
+            return f.read()
+
+
+# ---------------------------------------------------------------------------
 # Generation core (shared by all modes) — runs as background task
 # ---------------------------------------------------------------------------
 async def run_generation(bot, chat_id, *, prompt, caption, image_url=None,
@@ -1135,10 +1181,27 @@ async def run_generation(bot, chat_id, *, prompt, caption, image_url=None,
                         f"Link (expires 24h, save now):\n{video_url}",
                         reply_markup=vid_kb)
                 else:
-                    await bot.send_video(chat_id, video=data,
-                                         caption=(base or None),
-                                         supports_streaming=True,
-                                         reply_markup=vid_kb)
+                    try:
+                        note = await _to_video_note(data)
+                    except Exception:  # noqa: BLE001
+                        log.exception("video note conversion failed")
+                        note = None
+                    if note is None:
+                        # Fallback: plain video, as before.
+                        await bot.send_video(chat_id, video=data,
+                                             caption=(base or None),
+                                             supports_streaming=True,
+                                             reply_markup=vid_kb)
+                    else:
+                        # Circles can't carry a caption, so the caption and
+                        # the action buttons go in a reply right under it.
+                        note_msg = await bot.send_video_note(
+                            chat_id, video_note=note,
+                            length=VIDEO_NOTE_SIZE, duration=int(duration))
+                        await bot.send_message(
+                            chat_id, base or "⬆️",
+                            reply_to_message_id=note_msg.message_id,
+                            reply_markup=vid_kb)
                 any_sent = True
 
             credits_after = await get_credits(session)
